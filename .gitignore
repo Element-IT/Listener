@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.runtime/
+.venv/
+.models/
+.npm-cache/
+node_modules/
+npm-debug.log*
+__pycache__/
+*.pyc

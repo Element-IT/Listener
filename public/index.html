@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Camera Audio Listener</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-layout">
+      <aside class="channel-sidebar" aria-label="Каналы">
+        <div class="brand-block">
+          <p class="eyebrow">Local NVR Audio</p>
+          <h1>Каналы</h1>
+        </div>
+
+        <div id="channelGrid" class="channel-grid"></div>
+
+        <div class="sidebar-status">
+          <div class="status-pill" id="configStatus">Загрузка</div>
+        </div>
+      </aside>
+
+      <section class="content-shell">
+        <header class="content-header">
+          <div>
+            <p class="eyebrow">Канал <span id="activeChannelNumber">1</span></p>
+            <h2 id="activeChannelTitle">Канал 1</h2>
+            <p id="activeChannelSubtitle" class="muted-line">Live и архивное аудио</p>
+          </div>
+          <button id="settingsButton" class="icon-button" type="button" aria-label="Настройки" title="Настройки">⚙</button>
+        </header>
+
+        <nav class="tab-nav" aria-label="Разделы">
+          <button id="audioTabButton" class="tab-button active" type="button" data-tab="audio" aria-controls="audioTab" aria-selected="true">Прослушивание</button>
+          <button id="openAiTabButton" class="tab-button secondary" type="button" data-tab="openai" aria-controls="openAiTab" aria-selected="false">Действия OpenAI</button>
+        </nav>
+
+        <div id="audioTab" class="tab-page active" data-tab-panel="audio">
+          <section class="panel live-panel" aria-labelledby="liveTitle">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Live</p>
+                <h3 id="liveTitle">Прослушивание сейчас</h3>
+              </div>
+              <span id="liveTranscriptStatus" class="section-status">Остановлено</span>
+            </div>
+
+            <div class="player-controls">
+              <button id="startLiveButton" type="button">Старт</button>
+              <button id="stopLiveButton" class="secondary" type="button">Стоп</button>
+              <audio id="liveAudio" controls preload="none"></audio>
+            </div>
+
+            <div class="transcript-panel" aria-live="polite">
+              <div id="liveTranscript" class="transcript-text is-empty">Нет текста</div>
+            </div>
+          </section>
+
+          <section class="panel archive-panel" aria-labelledby="archiveTitle">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Archive</p>
+                <h3 id="archiveTitle">Записи выбранного канала</h3>
+              </div>
+              <div class="section-actions">
+                <span id="archiveSearchStatus" class="section-status neutral">Ожидает поиска</span>
+                <button id="searchButton" type="button">Искать</button>
+              </div>
+            </div>
+
+            <div class="date-grid">
+              <label>
+                С
+                <input id="from" type="datetime-local">
+              </label>
+              <label>
+                По
+                <input id="to" type="datetime-local">
+              </label>
+            </div>
+
+            <div id="selectedRecording" class="selected-recording is-empty">Запись не выбрана</div>
+            <audio id="archiveAudio" controls preload="none"></audio>
+
+            <div class="transcript-panel archive-transcript" aria-live="polite">
+              <div class="transcript-heading">
+                <span>Текст записи</span>
+                <span id="archiveTranscriptStatus">Нет записи</span>
+              </div>
+              <div id="archiveTranscript" class="transcript-text is-empty">Нет текста</div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Начало</th>
+                    <th>Конец</th>
+                    <th>Источник</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="recordingsBody">
+                  <tr>
+                    <td colspan="4" class="empty">Нет результатов</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <div id="openAiTab" class="tab-page" data-tab-panel="openai" hidden>
+          <section class="panel ai-panel" aria-labelledby="openAiTitle">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">OpenAI API</p>
+                <h3 id="openAiTitle">Группы и действия</h3>
+              </div>
+              <span id="openAiStatus" class="section-status">Ожидает</span>
+            </div>
+
+            <div class="automation-layout">
+              <section class="automation-column" aria-labelledby="groupBuilderTitle">
+                <div class="subsection-heading">
+                  <div>
+                    <p class="eyebrow">Groups</p>
+                    <h4 id="groupBuilderTitle">Группа камер</h4>
+                  </div>
+                  <span id="openAiGroupStatus" class="section-status neutral">Новая группа</span>
+                </div>
+
+                <label>
+                  Название
+                  <input id="openAiGroupName" type="text" maxlength="48" placeholder="Например: ресепшен">
+                </label>
+
+                <div class="date-grid">
+                  <label>
+                    С
+                    <input id="openAiGroupFrom" type="datetime-local">
+                  </label>
+                  <label>
+                    По
+                    <input id="openAiGroupTo" type="datetime-local">
+                  </label>
+                </div>
+
+                <fieldset class="camera-picker">
+                  <legend>Камеры 4 × 4</legend>
+                  <div class="picker-actions">
+                    <button id="openAiGroupSelectAllButton" class="inline file" type="button">Все</button>
+                    <button id="openAiGroupClearButton" class="inline file" type="button">Сброс</button>
+                  </div>
+                  <div id="openAiGroupChannelGrid" class="openai-channel-grid"></div>
+                </fieldset>
+
+                <div class="openai-actions">
+                  <button id="openAiSaveGroupButton" type="button">Сохранить группу</button>
+                  <button id="openAiResetGroupButton" class="secondary" type="button">Новая</button>
+                </div>
+              </section>
+
+              <section class="automation-column" aria-labelledby="savedGroupsTitle">
+                <div class="subsection-heading">
+                  <div>
+                    <p class="eyebrow">Saved</p>
+                    <h4 id="savedGroupsTitle">Список групп</h4>
+                  </div>
+                </div>
+                <div id="openAiGroupList" class="group-list"></div>
+              </section>
+            </div>
+
+            <div class="action-section">
+              <div class="subsection-heading">
+                <div>
+                  <p class="eyebrow">Actions</p>
+                  <h4>Действия</h4>
+                </div>
+                <button id="createActionButton" type="button">Создать действие</button>
+              </div>
+              <div id="openAiActionList" class="action-list"></div>
+            </div>
+
+            <div class="openai-progress">
+              <div class="openai-progress-head">
+                <span id="openAiProgressStage">Ожидает</span>
+                <span id="openAiProgressSummary">0%</span>
+              </div>
+              <div class="progress-shell" aria-label="Ход выполнения">
+                <div id="openAiProgressBar" class="progress-bar"></div>
+              </div>
+              <div class="stage-track" aria-label="Этапы выполнения">
+                <span class="stage-step" data-openai-stage="search">Поиск записей</span>
+                <span class="stage-step" data-openai-stage="transcribe">Транскрибация</span>
+                <span class="stage-step" data-openai-stage="ask">Запрос OpenAI</span>
+                <span class="stage-step" data-openai-stage="report">Отправка отчёта</span>
+              </div>
+              <div class="progress-stats">
+                <div>
+                  <span>Этапы</span>
+                  <strong id="openAiStageProgress">0/4</strong>
+                </div>
+                <div>
+                  <span>Камеры</span>
+                  <strong id="openAiCameraProgress">0/0</strong>
+                </div>
+                <div>
+                  <span>Записи</span>
+                  <strong id="openAiRecordingProgress">0/0</strong>
+                </div>
+                <div>
+                  <span>Текст</span>
+                  <strong id="openAiTranscriptProgress">0 фрагментов</strong>
+                </div>
+              </div>
+              <div id="openAiError" class="openai-error" hidden></div>
+              <pre id="openAiRunLog" class="openai-run-log">Журнал пуст</pre>
+              <div class="openai-actions">
+                <button id="openAiCancelButton" class="secondary" type="button">Стоп</button>
+              </div>
+            </div>
+
+            <div class="transcript-panel archive-transcript" aria-live="polite">
+              <div class="transcript-heading">
+                <span>Подгруженный текст</span>
+                <span id="openAiTranscriptStatus">Нет текста</span>
+              </div>
+              <div id="openAiTranscript" class="transcript-text openai-transcript is-empty">Нет текста</div>
+            </div>
+
+            <div class="transcript-panel archive-transcript openai-answer-panel" aria-live="polite">
+              <div class="transcript-heading">
+                <span>Ответ ChatGPT</span>
+                <span id="openAiAnswerStatus">Ожидает</span>
+              </div>
+              <div id="openAiAnswer" class="transcript-text openai-answer is-empty">Нет ответа</div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <dialog id="actionDialog" class="modal-dialog" aria-labelledby="actionDialogTitle">
+        <div class="modal-card">
+          <div class="drawer-header">
+            <div>
+              <p class="eyebrow">Action</p>
+              <h2 id="actionDialogTitle">Создать действие</h2>
+            </div>
+            <button id="actionDialogCloseButton" class="icon-button subtle" type="button" aria-label="Закрыть" title="Закрыть">×</button>
+          </div>
+
+          <label>
+            Название
+            <input id="actionName" type="text" maxlength="64" placeholder="Например: итоги утра">
+          </label>
+
+          <fieldset class="camera-picker">
+            <legend>Группы</legend>
+            <div id="actionGroupList" class="action-group-list"></div>
+          </fieldset>
+
+          <label class="question-field">
+            Вопрос
+            <textarea id="actionQuestion" rows="4" placeholder="О чём говорили сотрудники?"></textarea>
+          </label>
+
+          <div class="date-grid">
+            <label>
+              Период выполнения
+              <select id="actionPeriodMode">
+                <option value="daily">Ежедневно по времени групп</option>
+                <option value="weekly">Еженедельно по времени групп</option>
+                <option value="once">Единоразово по датам групп</option>
+              </select>
+            </label>
+            <label id="actionDayPresetLabel">
+              День для запуска
+              <select id="actionDayPreset">
+                <option value="today">Сегодня</option>
+                <option value="yesterday">Вчера</option>
+                <option value="tomorrow">Завтра</option>
+                <option value="custom">Своя дата</option>
+              </select>
+            </label>
+          </div>
+
+          <label id="actionCustomDateLabel" class="custom-date-field" hidden>
+            Дата
+            <input id="actionCustomDate" type="date">
+          </label>
+
+          <fieldset id="actionScheduleOptions" class="report-options" hidden>
+            <legend>Расписание</legend>
+            <label class="checkbox-row">
+              <input id="actionRunOnWeekends" type="checkbox">
+              <span>Обрабатывать записи в выходные</span>
+            </label>
+          </fieldset>
+
+          <fieldset id="actionReportOptions" class="report-options" hidden>
+            <legend>Отчёты на почту</legend>
+            <label class="checkbox-row">
+              <input id="actionReportDaily" type="checkbox">
+              <span>Отправлять отчёт за день</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="actionReportWeekly" type="checkbox">
+              <span>Отправлять отчёт за неделю</span>
+            </label>
+          </fieldset>
+
+          <div class="openai-actions modal-actions">
+            <button id="saveActionButton" type="button">Сохранить действие</button>
+            <button id="cancelActionButton" class="secondary" type="button">Отмена</button>
+          </div>
+        </div>
+      </dialog>
+
+      <div id="settingsBackdrop" class="settings-backdrop" hidden></div>
+      <aside id="settingsDrawer" class="settings-drawer" aria-hidden="true" aria-labelledby="settingsTitle">
+        <div class="drawer-header">
+          <div>
+            <p class="eyebrow">System</p>
+            <h2 id="settingsTitle">Настройки</h2>
+          </div>
+          <button id="settingsCloseButton" class="icon-button subtle" type="button" aria-label="Закрыть настройки" title="Закрыть">×</button>
+        </div>
+
+        <section class="settings-section" aria-label="Общие параметры">
+          <h3>Общие параметры</h3>
+          <label>
+            Vendor
+            <select id="vendor">
+              <option value="auto">Auto</option>
+              <option value="xm">XM/Xiongmai</option>
+              <option value="hikvision">Hikvision ISAPI</option>
+              <option value="dahua">Dahua CGI</option>
+              <option value="generic">Generic RTSP</option>
+            </select>
+          </label>
+          <label>
+            Поток
+            <select id="stream">
+              <option value="main">Main</option>
+              <option value="sub">Sub</option>
+            </select>
+          </label>
+          <label>
+            Звук
+            <select id="audioFilter">
+              <option value="voice">Речь</option>
+              <option value="strong">Сильно</option>
+              <option value="off">Без обработки</option>
+            </select>
+          </label>
+          <label>
+            Блок транскрибации, сек
+            <input id="transcriptSeconds" type="number" min="5" max="60" step="1" value="18">
+          </label>
+          <label>
+            Почты для отчётов
+            <textarea id="reportEmails" rows="3" placeholder="manager@example.com, security@example.com"></textarea>
+          </label>
+          <button id="probeButton" type="button">Проверить API</button>
+          <div id="settingsSummary" class="settings-summary">Загрузка</div>
+        </section>
+
+        <section class="settings-section" aria-label="Названия каналов">
+          <h3>Названия каналов</h3>
+          <div id="channelNameFields" class="channel-name-fields"></div>
+        </section>
+
+        <section class="settings-section" aria-label="Состояние">
+          <h3>Состояние</h3>
+          <pre id="log"></pre>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
