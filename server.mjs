@@ -29,12 +29,17 @@ const ACTION_SCHEDULER_STATE_KEY = 'action_scheduler_state';
 const ACTION_SCHEDULER_ENABLED = !process.argv.includes('--no-action-scheduler')
   && booleanFromEnv('ACTION_SCHEDULER_ENABLED', true);
 const ACTION_SCHEDULER_INTERVAL_MS = Math.max(10, numberFromEnv('ACTION_SCHEDULER_INTERVAL_SECONDS', 30)) * 1000;
+const ACTION_SCHEDULER_RETRY_DELAYS_MS = [60, 300, 900, 1800, 3600].map(seconds => seconds * 1000);
+const ACTION_SCHEDULER_RETRY_MAX_AGE_MS = Math.max(1, numberFromEnv('ACTION_SCHEDULER_RETRY_MAX_AGE_HOURS', 168)) * 60 * 60 * 1000;
+const MANUAL_ACTION_CLAIM_TTL_MS = Math.max(1, numberFromEnv('MANUAL_ACTION_CLAIM_TTL_HOURS', 36)) * 60 * 60 * 1000;
 let gigaAmWorkerState = null;
 let transcriberCheckPromise = null;
 let databasePoolPromise = null;
 let actionSchedulerTimer = null;
 let actionSchedulerRunning = false;
+let actionSchedulerStateMutation = Promise.resolve();
 const activeScheduledActions = new Set();
+const activeManualActions = new Map();
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -527,8 +532,34 @@ async function storageMutation(req, res, pathname) {
     return json(res, 200, { ok: true, actions: await readOpenAiActions() });
   }
 
+  if (pathname === '/api/storage/action-trigger') {
+    return json(res, 202, {
+      ok: true,
+      ...await triggerScheduledOpenAiAction(payload)
+    });
+  }
+
+  if (pathname === '/api/storage/action-run/start') {
+    return json(res, 200, {
+      ok: true,
+      ...await claimManualActionRun(payload)
+    });
+  }
+
+  if (pathname === '/api/storage/action-run/release') {
+    releaseManualActionRun(payload);
+    return json(res, 200, { ok: true });
+  }
+
   if (pathname === '/api/storage/action-run') {
-    await insertOpenAiActionRun(payload);
+    try {
+      await insertOpenAiActionRun(payload);
+      await reconcileManualActionRun(payload).catch(error => {
+        console.warn(`Could not reconcile manual action run with scheduler: ${publicError(error)}`);
+      });
+    } finally {
+      releaseManualActionRun(payload);
+    }
     return json(res, 200, { ok: true });
   }
 
@@ -747,6 +778,149 @@ async function insertOpenAiActionRun(run) {
   );
 }
 
+async function claimManualActionRun(run) {
+  const candidate = await resolveManualActionCandidate(run);
+  if (candidate) {
+    throw httpError(409, 'Плановое действие запускается на сервере в фоне. Обновите страницу и нажмите «Запустить» ещё раз.');
+  }
+  const actionId = String(run?.actionId || candidate?.action?.id || '').trim();
+  const runKey = candidate?.runKey || `manual:${crypto.randomUUID()}`;
+  if (!actionId) throw httpError(400, 'Action id is required.');
+
+  const activeKey = `${actionId}:${runKey}`;
+  if (activeScheduledActions.has(activeKey)) {
+    throw httpError(409, 'Этот период уже выполняется в фоне. Дождитесь завершения или остановите фоновый процесс.');
+  }
+  if (manualActionClaim(activeKey)) {
+    throw httpError(409, 'Этот период уже запущен вручную.');
+  }
+
+  let reconcileEligible = false;
+  if (candidate) {
+    const schedulerState = await readActionSchedulerState();
+    const modeState = schedulerState.actions?.[actionId]?.[candidate.periodMode];
+    const candidateState = scheduledCandidateState(modeState, runKey);
+    const stateIsTerminal = candidateState?.status === 'success' || candidateState?.status === 'delivery_uncertain';
+    const hasPendingAttempt = Boolean(candidateState && !stateIsTerminal);
+    const isDueNow = scheduledActionCandidates(
+      candidate.action,
+      new Map(candidate.groups.map(group => [group.id, group])),
+      new Date()
+    ).some(item => item.runKey === runKey);
+    reconcileEligible = hasPendingAttempt || (!candidateState && isDueNow);
+  }
+
+  const deliveryKey = reconcileEligible
+    ? `${actionId}:${runKey}`
+    : `${actionId}:manual:${crypto.randomUUID()}`;
+  if (activeScheduledActions.has(activeKey)) {
+    throw httpError(409, 'Этот период уже выполняется в фоне. Дождитесь завершения или остановите фоновый процесс.');
+  }
+  if (manualActionClaim(activeKey)) {
+    throw httpError(409, 'Этот период уже запущен вручную.');
+  }
+  activeManualActions.set(activeKey, {
+    candidate,
+    deliveryKey,
+    reconcileEligible,
+    expiresAt: Date.now() + MANUAL_ACTION_CLAIM_TTL_MS
+  });
+
+  return { runKey, deliveryKey, reconcileEligible };
+}
+
+function releaseManualActionRun(run) {
+  const actionId = String(run?.actionId || '').trim();
+  const runKey = String(run?.runKey || '').trim();
+  if (!actionId || !runKey) return;
+  activeManualActions.delete(`${actionId}:${runKey}`);
+}
+
+function manualActionClaim(activeKey) {
+  const claim = activeManualActions.get(activeKey);
+  if (!claim) return null;
+  if (Number(claim.expiresAt) <= Date.now()) {
+    activeManualActions.delete(activeKey);
+    return null;
+  }
+  return claim;
+}
+
+async function resolveManualActionCandidate(run) {
+  const actionId = String(run?.actionId || '').trim();
+  const from = String(run?.from || '').trim();
+  const to = String(run?.to || '').trim();
+  const requestedPeriodMode = String(run?.periodMode || '').trim();
+  const fromMs = localDateTimeMs(from);
+  const toMs = localDateTimeMs(to);
+  if (!actionId || !from || !to || !fromMs || !toMs || toMs <= fromMs) {
+    return null;
+  }
+
+  const actions = await readOpenAiActions();
+  const action = actions.find(item => item.id === actionId);
+  if (!action || action.periodMode === 'once') return null;
+
+  const periodMode = requestedPeriodMode || action.periodMode;
+  if (periodMode !== 'daily' && periodMode !== 'weekly') return null;
+  const groupMap = new Map((await readOpenAiGroups()).map(group => [group.id, group]));
+  const groups = (action.groupIds || []).map(groupId => groupMap.get(groupId)).filter(Boolean);
+  if (!groups.length) return null;
+
+  const configHash = scheduledActionConfigHash(action, groups, periodMode);
+  return {
+    action,
+    groups,
+    selections: [],
+    periodMode,
+    from,
+    to,
+    dueAt: run?.startedAt || new Date().toISOString(),
+    runKey: `${periodMode}:${from}:${to}:${configHash}`,
+    configHash
+  };
+}
+
+async function reconcileManualActionRun(run) {
+  const details = run?.details && typeof run.details === 'object' ? run.details : run;
+  if (
+    !run
+    || (run.status !== 'success' && run.status !== 'delivery_uncertain')
+    || run.scheduled === true
+    || details?.scheduled === true
+  ) {
+    return;
+  }
+
+  const actionId = String(run.actionId || run.id || '').trim();
+  const suppliedRunKey = String(run.runKey || details?.runKey || '').trim();
+  const activeKey = actionId && suppliedRunKey ? `${actionId}:${suppliedRunKey}` : '';
+  const claim = activeKey ? manualActionClaim(activeKey) : null;
+  const candidate = claim?.candidate || await resolveManualActionCandidate({
+    ...run,
+    from: run.from || details?.from,
+    to: run.to || details?.to,
+    periodMode: run.periodMode || details?.periodMode || details?.action?.periodMode
+  });
+  if (!candidate || (suppliedRunKey && suppliedRunKey !== candidate.runKey)) return;
+
+  await mutateActionSchedulerState(state => {
+    const modeState = state.actions?.[candidate.action.id]?.[candidate.periodMode];
+    const candidateState = scheduledCandidateState(modeState, candidate.runKey, candidate);
+    const stateIsTerminal = candidateState?.status === 'success' || candidateState?.status === 'delivery_uncertain';
+    const hasPendingAttempt = Boolean(candidateState && !stateIsTerminal);
+    if (!claim?.reconcileEligible && !hasPendingAttempt) return false;
+
+    markActionSchedulerState(state, candidate, {
+      ...run,
+      status: run.status,
+      runKey: candidate.runKey,
+      scheduled: false
+    });
+    return true;
+  });
+}
+
 async function updateOpenAiActionLastRun(actionId, lastRun) {
   if (!actionId || !lastRun || typeof lastRun !== 'object') return;
   await dbQuery(
@@ -795,13 +969,21 @@ async function runActionSchedulerTick() {
     const now = new Date();
 
     for (const action of actions) {
-      const candidates = scheduledActionCandidates(action, groupMap, now);
+      const actionState = schedulerState.actions?.[action.id];
+      const candidates = uniqueScheduledCandidates([
+        ...scheduledRetryCandidates(action, groupMap, actionState, now),
+        ...scheduledActionCandidates(action, groupMap, now)
+      ]);
       for (const candidate of candidates) {
-        const actionState = schedulerState.actions?.[action.id]?.[candidate.periodMode];
-        if (actionState?.runKey === candidate.runKey) continue;
+        if (actionLastRunMatchesCandidate(action.lastRun, candidate)) continue;
+        const liveSchedulerState = await readActionSchedulerState();
+        const modeState = liveSchedulerState.actions?.[action.id]?.[candidate.periodMode];
+        const candidateState = scheduledCandidateState(modeState, candidate.runKey, candidate);
+        if (!shouldRunScheduledCandidate(candidateState, candidate, now)) continue;
 
         const activeKey = `${action.id}:${candidate.runKey}`;
         if (activeScheduledActions.has(activeKey)) continue;
+        if (manualActionClaim(activeKey)) continue;
 
         activeScheduledActions.add(activeKey);
         let lastRun;
@@ -816,13 +998,103 @@ async function runActionSchedulerTick() {
           activeScheduledActions.delete(activeKey);
         }
 
-        markActionSchedulerState(schedulerState, candidate, lastRun);
-        await writeActionSchedulerState(schedulerState);
+        await mutateActionSchedulerState(state => {
+          markActionSchedulerState(state, candidate, lastRun);
+        });
       }
     }
   } finally {
     actionSchedulerRunning = false;
   }
+}
+
+async function triggerScheduledOpenAiAction(payload) {
+  const actionId = String(payload?.actionId || '').trim();
+  if (!actionId) throw httpError(400, 'Action id is required.');
+
+  const activePrefix = `${actionId}:`;
+  const activeRunKey = [...activeScheduledActions].find(key => key.startsWith(activePrefix));
+  if (activeRunKey) {
+    return {
+      status: 'running',
+      message: 'Действие уже выполняется в фоне.',
+      runKey: activeRunKey.slice(activePrefix.length)
+    };
+  }
+  if ([...activeManualActions.keys()].some(key => key.startsWith(activePrefix) && manualActionClaim(key))) {
+    throw httpError(409, 'Действие уже выполняется вручную.');
+  }
+
+  const [actions, groups, schedulerState] = await Promise.all([
+    readOpenAiActions(),
+    readOpenAiGroups(),
+    readActionSchedulerState()
+  ]);
+  const action = actions.find(item => item.id === actionId);
+  if (!action) throw httpError(404, 'Действие не найдено.');
+  if (action.periodMode === 'once') {
+    throw httpError(409, 'Одноразовые действия запускаются в открытой странице.');
+  }
+
+  const groupMap = new Map(groups.map(group => [group.id, group]));
+  const actionState = schedulerState.actions?.[action.id];
+  const now = new Date();
+  const candidates = uniqueScheduledCandidates([
+    ...scheduledRetryCandidates(action, groupMap, actionState, now, { ignoreMaxAge: true }),
+    ...scheduledActionCandidates(action, groupMap, now)
+  ]);
+  const preferredRunKey = String(action.lastRun?.runKey || '');
+  const runnableCandidates = candidates.filter(item => {
+      if (actionLastRunMatchesCandidate(action.lastRun, item)) return false;
+      const modeState = actionState?.[item.periodMode];
+      const itemState = scheduledCandidateState(modeState, item.runKey, item);
+      return !itemState || (itemState.status !== 'success' && itemState.status !== 'delivery_uncertain');
+    });
+  const candidate = runnableCandidates.find(item => {
+    const modeState = actionState?.[item.periodMode];
+    const itemState = scheduledCandidateState(modeState, item.runKey, item);
+    return itemState && itemState.status !== 'success' && itemState.status !== 'delivery_uncertain';
+  }) || runnableCandidates.find(item => item.runKey === preferredRunKey)
+    || runnableCandidates[0];
+  if (!candidate) {
+    throw httpError(409, 'Сейчас нет завершённого периода или ошибки, которую можно запустить повторно.');
+  }
+
+  await mutateActionSchedulerState(state => {
+    forceScheduledCandidateRetry(state, candidate, now);
+  });
+  const timer = setTimeout(() => {
+    runActionSchedulerTick().catch(error => {
+      console.warn(`Manual scheduler trigger failed: ${publicError(error)}`);
+    });
+  }, 0);
+  timer.unref?.();
+
+  return {
+    status: 'queued',
+    message: 'Действие поставлено в фоновую очередь.',
+    runKey: candidate.runKey,
+    from: candidate.from,
+    to: candidate.to
+  };
+}
+
+function forceScheduledCandidateRetry(state, candidate, now = new Date()) {
+  const actionState = state.actions?.[candidate.action.id];
+  const modeState = actionState?.[candidate.periodMode];
+  if (!modeState || typeof modeState !== 'object') return;
+  const retryAt = now.toISOString();
+  const pending = scheduledPendingStates(modeState).map(item => item.runKey === candidate.runKey
+    ? { ...item, attempts: 0, firstAttemptAt: retryAt, nextRetryAt: retryAt }
+    : item);
+  const nextModeState = modeState.runKey === candidate.runKey
+    ? { ...modeState, attempts: 0, firstAttemptAt: retryAt, nextRetryAt: retryAt, pending }
+    : { ...modeState, pending };
+  state.actions = state.actions && typeof state.actions === 'object' ? state.actions : {};
+  state.actions[candidate.action.id] = {
+    ...(actionState || {}),
+    [candidate.periodMode]: nextModeState
+  };
 }
 
 async function readPublicActionSchedulerState() {
@@ -852,22 +1124,261 @@ async function writeActionSchedulerState(state) {
   });
 }
 
-function markActionSchedulerState(state, candidate, lastRun) {
+function mutateActionSchedulerState(mutator) {
+  const operation = actionSchedulerStateMutation.then(async () => {
+    const state = await readActionSchedulerState();
+    const result = await mutator(state);
+    if (result === false) return false;
+    await writeActionSchedulerState(state);
+    return result;
+  });
+  actionSchedulerStateMutation = operation.catch(() => undefined);
+  return operation;
+}
+
+function markActionSchedulerState(state, candidate, lastRun, now = new Date()) {
   state.actions = state.actions && typeof state.actions === 'object' ? state.actions : {};
   const current = state.actions[candidate.action.id] && typeof state.actions[candidate.action.id] === 'object'
     ? state.actions[candidate.action.id]
     : {};
+  const modeState = current[candidate.periodMode] && typeof current[candidate.periodMode] === 'object'
+    ? current[candidate.periodMode]
+    : {};
+  const previous = scheduledCandidateState(modeState, candidate.runKey, candidate) || {};
+  const sameRun = previous.runKey === candidate.runKey;
+  const attempts = (sameRun ? Math.max(0, Number(previous.attempts) || 0) : 0) + 1;
+  const status = lastRun?.status || 'unknown';
+  const terminal = status === 'success' || status === 'delivery_uncertain';
+  const finishedAt = lastRun?.finishedAt || lastRun?.at || now.toISOString();
+  const finishedAtMs = Date.parse(finishedAt);
+  const nextRetryAt = terminal
+    ? ''
+    : new Date((Number.isFinite(finishedAtMs) ? finishedAtMs : now.getTime()) + scheduledRetryDelayMs(attempts)).toISOString();
+  const entry = {
+    runKey: candidate.runKey,
+    status,
+    at: lastRun?.at || new Date().toISOString(),
+    from: candidate.from,
+    to: candidate.to,
+    error: lastRun?.error || '',
+    stage: lastRun?.stage || '',
+    attempts,
+    firstAttemptAt: sameRun && previous.firstAttemptAt
+      ? previous.firstAttemptAt
+      : (lastRun?.startedAt || lastRun?.at || now.toISOString()),
+    lastAttemptAt: finishedAt,
+    nextRetryAt,
+    candidate: terminal ? undefined : serializeScheduledCandidate(candidate)
+  };
+  const pending = scheduledPendingStates(modeState)
+    .filter(item => item.runKey !== candidate.runKey);
+  const completed = scheduledCompletedStates(modeState)
+    .filter(item => item.runKey !== candidate.runKey);
+  if (!terminal) {
+    pending.push(entry);
+  } else {
+    completed.push(entry);
+    const currentConfigHash = scheduledActionConfigHash(candidate.action, candidate.groups || [], candidate.periodMode);
+    if (candidate.configHash && candidate.configHash !== currentConfigHash) {
+      const compatibleRunKey = `${candidate.periodMode}:${candidate.from}:${candidate.to}:${currentConfigHash}`;
+      if (!completed.some(item => item.runKey === compatibleRunKey)) {
+        completed.push({
+          ...entry,
+          runKey: compatibleRunKey,
+          migratedFromRunKey: candidate.runKey
+        });
+      }
+    }
+  }
+
   state.actions[candidate.action.id] = {
     ...current,
     [candidate.periodMode]: {
-      runKey: candidate.runKey,
-      status: lastRun?.status || 'unknown',
-      at: lastRun?.at || new Date().toISOString(),
-      from: candidate.from,
-      to: candidate.to,
-      error: lastRun?.error || ''
+      ...entry,
+      pending: pending.slice(-50),
+      completed: completed.slice(-50)
     }
   };
+}
+
+function scheduledPendingStates(modeState) {
+  if (!modeState || typeof modeState !== 'object') return [];
+  const pending = Array.isArray(modeState.pending)
+    ? modeState.pending.filter(item => item && typeof item === 'object' && item.runKey)
+    : [];
+  if (
+    modeState.status === 'error'
+    && modeState.runKey
+    && !pending.some(item => item.runKey === modeState.runKey)
+  ) {
+    pending.push({
+      ...modeState,
+      pending: undefined,
+      completed: undefined
+    });
+  }
+  return pending;
+}
+
+function scheduledCandidateState(modeState, runKey, candidate = null) {
+  if (!modeState || !runKey) return null;
+  if (modeState.runKey === runKey) return modeState;
+  const exact = scheduledPendingStates(modeState).find(item => item.runKey === runKey)
+    || scheduledCompletedStates(modeState).find(item => item.runKey === runKey);
+  if (exact || !candidate) return exact || null;
+
+  const legacyHash = scheduledActionConfigHash(candidate.action, candidate.groups || [], candidate.periodMode, { legacy: true });
+  const legacyRunKey = `${candidate.periodMode}:${candidate.from}:${candidate.to}:${legacyHash}`;
+  if (legacyRunKey === runKey) return null;
+  return scheduledCompletedStates(modeState).find(item => item.runKey === legacyRunKey) || null;
+}
+
+function actionLastRunMatchesCandidate(lastRun, candidate) {
+  if (!lastRun || (lastRun.status !== 'success' && lastRun.status !== 'delivery_uncertain')) return false;
+  if (lastRun.runKey === candidate.runKey) return true;
+  const legacyHash = scheduledActionConfigHash(candidate.action, candidate.groups || [], candidate.periodMode, { legacy: true });
+  return lastRun.runKey === `${candidate.periodMode}:${candidate.from}:${candidate.to}:${legacyHash}`;
+}
+
+function scheduledCompletedStates(modeState) {
+  if (!modeState || typeof modeState !== 'object') return [];
+  const completed = Array.isArray(modeState.completed)
+    ? modeState.completed.filter(item => item && typeof item === 'object' && item.runKey)
+    : [];
+  if (
+    (modeState.status === 'success' || modeState.status === 'delivery_uncertain')
+    && modeState.runKey
+    && !completed.some(item => item.runKey === modeState.runKey)
+  ) {
+    completed.push({
+      ...modeState,
+      pending: undefined,
+      completed: undefined
+    });
+  }
+  return completed;
+}
+
+function shouldRunScheduledCandidate(actionState, candidate, now = new Date()) {
+  if (!actionState || actionState.runKey !== candidate.runKey) return true;
+  if (actionState.status === 'success' || actionState.status === 'delivery_uncertain') return false;
+
+  const firstAttemptAtMs = Date.parse(actionState.firstAttemptAt || actionState.at || '');
+  if (Number.isFinite(firstAttemptAtMs) && now.getTime() - firstAttemptAtMs > ACTION_SCHEDULER_RETRY_MAX_AGE_MS) {
+    return false;
+  }
+
+  const nextRetryAtMs = Date.parse(actionState.nextRetryAt || '');
+  return !Number.isFinite(nextRetryAtMs) || now.getTime() >= nextRetryAtMs;
+}
+
+function scheduledRetryDelayMs(attempts) {
+  const index = Math.min(
+    ACTION_SCHEDULER_RETRY_DELAYS_MS.length - 1,
+    Math.max(0, (Number(attempts) || 1) - 1)
+  );
+  return ACTION_SCHEDULER_RETRY_DELAYS_MS[index];
+}
+
+function serializeScheduledCandidate(candidate) {
+  return {
+    periodMode: candidate.periodMode,
+    from: candidate.from,
+    to: candidate.to,
+    dueAt: candidate.dueAt,
+    runKey: candidate.runKey,
+    configHash: candidate.configHash,
+    selections: (candidate.selections || []).map(selection => ({ ...selection }))
+  };
+}
+
+function scheduledRetryCandidates(action, groupMap, actionState, now = new Date(), options = {}) {
+  if (!action || !actionState || action.periodMode === 'once') return [];
+
+  const groups = (action.groupIds || []).map(groupId => groupMap.get(groupId)).filter(Boolean);
+  if (!groups.length) return [];
+
+  return ['daily', 'weekly'].flatMap(periodMode => {
+    if (periodMode === 'daily' && action.periodMode !== 'daily' && !action.reportDaily) return [];
+    if (periodMode === 'weekly' && action.periodMode !== 'weekly' && !action.reportWeekly) return [];
+    const configHash = scheduledActionConfigHash(action, groups, periodMode);
+    const legacyConfigHash = scheduledActionConfigHash(action, groups, periodMode, { legacy: true });
+    return scheduledPendingStates(actionState[periodMode]).map(state => {
+      const firstAttemptAtMs = Date.parse(state.firstAttemptAt || state.at || '');
+      if (!options.ignoreMaxAge && Number.isFinite(firstAttemptAtMs) && now.getTime() - firstAttemptAtMs > ACTION_SCHEDULER_RETRY_MAX_AGE_MS) {
+        return null;
+      }
+
+      const storedConfigHash = String(state.runKey || '').slice(String(state.runKey || '').lastIndexOf(':') + 1);
+      const matchingConfigHash = storedConfigHash === configHash
+        ? configHash
+        : storedConfigHash === legacyConfigHash
+          ? legacyConfigHash
+          : '';
+      if (!matchingConfigHash) return null;
+      const snapshot = restoreScheduledCandidateSnapshot(action, groups, state, periodMode, matchingConfigHash);
+      if (!snapshot || snapshot.runKey !== state.runKey || snapshot.configHash !== matchingConfigHash) return null;
+
+      const selections = Array.isArray(snapshot.selections)
+        ? snapshot.selections.filter(selection => selection && selection.from && selection.to && Number(selection.channel) > 0)
+        : [];
+      if (!selections.length) return null;
+
+      return {
+        action,
+        groups,
+        selections,
+        periodMode,
+        from: snapshot.from,
+        to: snapshot.to,
+        dueAt: snapshot.dueAt,
+        runKey: snapshot.runKey,
+        configHash: matchingConfigHash
+      };
+    }).filter(Boolean);
+  });
+}
+
+function restoreScheduledCandidateSnapshot(action, groups, state, periodMode, configHash) {
+  if (state.candidate && typeof state.candidate === 'object') {
+    return state.candidate;
+  }
+
+  const storedConfigHash = String(state.runKey || '').slice(String(state.runKey || '').lastIndexOf(':') + 1);
+  const datePart = String(state.from || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart) || storedConfigHash !== configHash) return null;
+
+  const retryAction = {
+    ...action,
+    dayPreset: 'custom',
+    customDate: datePart,
+    runOnWeekends: true
+  };
+  const selections = resolveScheduledActionSelections(retryAction, groups, new Date(), periodMode);
+  const from = earliestLocalDateTime(selections.map(selection => selection.from));
+  const to = latestLocalDateTime(selections.map(selection => selection.to));
+  if (!selections.length || from !== state.from || to !== state.to) return null;
+
+  return {
+    periodMode,
+    from,
+    to,
+    dueAt: state.dueAt || state.at || new Date().toISOString(),
+    runKey: state.runKey,
+    configHash,
+    selections
+  };
+}
+
+function uniqueScheduledCandidates(candidates) {
+  const result = new Map();
+  for (const candidate of candidates || []) {
+    const key = candidate?.periodMode && candidate?.from && candidate?.to
+      ? `${candidate.periodMode}:${candidate.from}:${candidate.to}`
+      : candidate?.runKey;
+    if (candidate?.runKey && key && !result.has(key)) result.set(key, candidate);
+  }
+  return [...result.values()];
 }
 
 function scheduledActionCandidates(action, groupMap, now = new Date()) {
@@ -909,25 +1420,7 @@ function scheduledActionCandidate(action, groupMap, now, periodMode = action?.pe
     return null;
   }
 
-  const configHash = crypto.createHash('sha1')
-    .update(JSON.stringify({
-      name: action.name,
-      question: action.question,
-      periodMode,
-      dayPreset: action.dayPreset,
-      customDate: action.customDate,
-      groupIds: action.groupIds,
-      reportDaily: Boolean(action.reportDaily),
-      reportWeekly: Boolean(action.reportWeekly),
-      groups: groups.map(group => ({
-        id: group.id,
-        name: group.name,
-        channels: group.channels,
-        from: group.from,
-        to: group.to
-      }))
-    }))
-    .digest('hex');
+  const configHash = scheduledActionConfigHash(action, groups, periodMode);
 
   return {
     action,
@@ -937,8 +1430,33 @@ function scheduledActionCandidate(action, groupMap, now, periodMode = action?.pe
     from,
     to,
     dueAt: new Date(dueAtMs).toISOString(),
-    runKey: `${periodMode}:${from}:${to}:${configHash}`
+    runKey: `${periodMode}:${from}:${to}:${configHash}`,
+    configHash
   };
+}
+
+function scheduledActionConfigHash(action, groups, periodMode, options = {}) {
+  const config = {
+    name: action.name,
+    question: action.question,
+    periodMode,
+    dayPreset: action.dayPreset,
+    customDate: action.customDate,
+    groupIds: action.groupIds,
+    reportDaily: Boolean(action.reportDaily),
+    reportWeekly: Boolean(action.reportWeekly),
+    groups: groups.map(group => ({
+      id: group.id,
+      name: group.name,
+      channels: group.channels,
+      from: group.from,
+      to: group.to
+    }))
+  };
+  if (!options.legacy && periodMode === 'daily') config.runOnWeekends = Boolean(action.runOnWeekends);
+  return crypto.createHash('sha1')
+    .update(JSON.stringify(config))
+    .digest('hex');
 }
 
 function resolveScheduledActionSelections(action, groups, now = new Date(), periodMode = action?.periodMode) {
@@ -985,7 +1503,11 @@ function resolveScheduledDailyDate(action, now = new Date()) {
     today: 0,
     tomorrow: 1
   }[action.dayPreset] ?? 0;
-  return offsetDatePart(toDateInputLocal(now), offset);
+  let date = offsetDatePart(toDateInputLocal(now), offset);
+  if (action.dayPreset === 'yesterday' && !action.runOnWeekends) {
+    while (isWeekendDatePart(date)) date = offsetDatePart(date, -1);
+  }
+  return date;
 }
 
 function resolveScheduledWeeklyDates(action, now = new Date()) {
@@ -1009,6 +1531,19 @@ async function runScheduledOpenAiAction(candidate, context) {
   let stage = 'search';
 
   console.log(`OpenAI action scheduler: starting "${candidate.action.name}" for ${candidate.from} - ${candidate.to}`);
+  await updateOpenAiActionLastRun(candidate.action.id, {
+    status: 'running',
+    scheduled: true,
+    at: startedAt.toISOString(),
+    startedAt: startedAt.toISOString(),
+    from: candidate.from,
+    to: candidate.to,
+    dueAt: candidate.dueAt,
+    runKey: candidate.runKey,
+    stage: 'search'
+  }).catch(error => {
+    console.warn(`OpenAI action scheduler could not save running status: ${publicError(error)}`);
+  });
 
   try {
     transcriptResult = await buildScheduledActionTranscript(candidate, context);
@@ -1048,6 +1583,7 @@ async function runScheduledOpenAiAction(candidate, context) {
         method: 'POST',
         body: {
           reportTypes,
+          deliveryKey: `${candidate.action.id}:${candidate.runKey}`,
           generatedAt: new Date().toISOString(),
           from: candidate.from,
           to: candidate.to,
@@ -1055,6 +1591,7 @@ async function runScheduledOpenAiAction(candidate, context) {
           answer: answerData.answer || '',
           transcript: transcriptResult.contextLines.join('\n'),
           transcriptLines: transcriptResult.contextLines.length,
+          warnings: transcriptResult.warnings,
           model: answerData.model || '',
           responseId: answerData.responseId || '',
           action: {
@@ -1101,10 +1638,15 @@ async function runScheduledOpenAiAction(candidate, context) {
       reports: reportData?.sent || [],
       runKey: candidate.runKey
     };
-    await persistScheduledActionRun(candidate, lastRun, {
-      reportTypes,
-      warnings: transcriptResult.warnings
-    });
+    try {
+      await persistScheduledActionRun(candidate, lastRun, {
+        reportTypes,
+        warnings: transcriptResult.warnings
+      });
+    } catch (error) {
+      lastRun.persistenceError = publicError(error);
+      console.warn(`OpenAI action scheduler completed but could not save success: ${lastRun.persistenceError}`);
+    }
     console.log(`OpenAI action scheduler: finished "${candidate.action.name}"`);
     return lastRun;
   } catch (error) {
@@ -1119,8 +1661,9 @@ async function runScheduledOpenAiAction(candidate, context) {
 }
 
 async function persistScheduledActionFailure(candidate, error, context = {}) {
+  const deliveryUncertain = Boolean(error?.deliveryUncertain || error?.details?.deliveryUncertain);
   const lastRun = {
-    status: 'error',
+    status: deliveryUncertain ? 'delivery_uncertain' : 'error',
     scheduled: true,
     at: new Date().toISOString(),
     startedAt: context.startedAt?.toISOString?.() || new Date().toISOString(),
@@ -1188,6 +1731,8 @@ async function buildScheduledActionTranscript(candidate, context) {
   const warnings = [];
   let knownRecordings = 0;
   let completedRecordings = 0;
+  let failedSearches = 0;
+  let failedRecordings = 0;
 
   for (const selection of candidate.selections) {
     const label = `${selection.groupName} · ${channelLabelFromRows(context.labels, selection.channel)}`;
@@ -1197,7 +1742,14 @@ async function buildScheduledActionTranscript(candidate, context) {
     query.set('_', Date.now());
 
     const searchPath = `/api/recordings/search?${query}`;
-    const searchData = await localJsonApi(searchPath);
+    let searchData;
+    try {
+      searchData = await localJsonApi(searchPath);
+    } catch (error) {
+      failedSearches += 1;
+      warnings.push(`${label}: поиск записей: ${publicError(error)}`);
+      continue;
+    }
     if (searchData.warning) warnings.push(`${label}: ${searchData.warning}`);
 
     const items = (searchData.items || [])
@@ -1211,24 +1763,44 @@ async function buildScheduledActionTranscript(candidate, context) {
     }
 
     for (const entry of items) {
-      await transcribeScheduledRecording({
-        item: entry.item,
-        coverage: entry.coverage,
-        selection,
-        settings: context.settings,
-        labels: context.labels,
-        vendor: searchData.vendor || '',
-        contextLines
-      });
-      completedRecordings += 1;
+      try {
+        await transcribeScheduledRecording({
+          item: entry.item,
+          coverage: entry.coverage,
+          selection,
+          settings: context.settings,
+          labels: context.labels,
+          vendor: searchData.vendor || '',
+          contextLines
+        });
+        completedRecordings += 1;
+      } catch (error) {
+        failedRecordings += 1;
+        const recording = entry.item.fileName || entry.item.startTime || 'архивный фрагмент';
+        warnings.push(`${label}: ${recording}: ${publicError(error)}`);
+      }
     }
+  }
+
+  if (!completedRecordings && !contextLines.length && (failedSearches || failedRecordings)) {
+    throw httpError(
+      502,
+      `Не удалось получить пригодный транскрипт: ошибок поиска ${failedSearches}, ошибок записей ${failedRecordings}.`,
+      {
+        failedSearches,
+        failedRecordings,
+        warnings: warnings.slice(-100)
+      }
+    );
   }
 
   return {
     contextLines,
     warnings,
     knownRecordings,
-    completedRecordings
+    completedRecordings,
+    failedSearches,
+    failedRecordings
   };
 }
 
@@ -2493,6 +3065,11 @@ function normalizeReportTypes(payload) {
   return [...new Set(values.map(value => String(value || '').toLowerCase()).filter(value => value === 'daily' || value === 'weekly'))];
 }
 
+function normalizeReportWarnings(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(item => String(item || '').trim()).filter(Boolean))].slice(0, 100);
+}
+
 function normalizeEmailList(value) {
   const values = Array.isArray(value) ? value : String(value || '').split(/[,\n;]/);
   return [...new Set(values.map(item => String(item || '').trim()).filter(item => isEmailAddress(extractEmailAddress(item))))];
@@ -2504,6 +3081,7 @@ function isEmailAddress(value) {
 
 function reportEmailMessage(payload, reportType, recipients) {
   const action = payload.action && typeof payload.action === 'object' ? payload.action : {};
+  const warnings = normalizeReportWarnings(payload.warnings);
   const reportLabel = reportType === 'weekly' ? 'за неделю' : 'за день';
   const subject = `Отчет ${reportLabel}: ${action.name || 'действие камер'}`;
   const generatedAt = payload.generatedAt || new Date().toISOString();
@@ -2515,6 +3093,7 @@ function reportEmailMessage(payload, reportType, recipients) {
     `Действие: ${action.name || 'без названия'}`,
     `Сформирован: ${formatReportDateTime(generatedAt)}`,
     `Период: ${period}`,
+    ...(warnings.length ? [`Предупреждений при обработке: ${warnings.length}`] : []),
     '',
     `DOCX-файл прикреплен: ${attachment.fileName}`
   ].join('\n');
@@ -2525,6 +3104,7 @@ function reportEmailMessage(payload, reportType, recipients) {
     `<p><strong>Действие:</strong> ${escapeHtmlText(action.name || 'без названия')}</p>`,
     `<p><strong>Сформирован:</strong> ${escapeHtmlText(formatReportDateTime(generatedAt))}</p>`,
     `<p><strong>Период:</strong> ${escapeHtmlText(period)}</p>`,
+    ...(warnings.length ? [`<p><strong>Предупреждений при обработке:</strong> ${warnings.length}</p>`] : []),
     `<p>DOCX-файл прикреплен: <strong>${escapeHtmlText(attachment.fileName)}</strong></p>`,
     '</body></html>'
   ].join('');
@@ -2534,8 +3114,16 @@ function reportEmailMessage(payload, reportType, recipients) {
     subject,
     text,
     html,
+    messageId: reportMessageId(payload, reportType),
     attachments: [attachment]
   };
+}
+
+function reportMessageId(payload, reportType) {
+  const deliveryKey = String(payload.deliveryKey || '').trim();
+  if (!deliveryKey) return `${crypto.randomUUID()}@camera-audio-listener`;
+  const digest = crypto.createHash('sha256').update(`${deliveryKey}:${reportType}`).digest('hex');
+  return `${digest}@camera-audio-listener`;
 }
 
 function buildReportDocxAttachment(payload, reportType) {
@@ -2579,6 +3167,7 @@ function reportDocxDocumentXml(payload, reportType) {
   const generatedAt = payload.generatedAt || new Date().toISOString();
   const question = String(payload.question || '').trim() || 'Вопрос не указан.';
   const answer = String(payload.answer || '').trim() || 'Ответ не получен.';
+  const warnings = normalizeReportWarnings(payload.warnings);
 
   const blocks = [
     wParagraph('OPENAI API', 'Kicker'),
@@ -2595,6 +3184,10 @@ function reportDocxDocumentXml(payload, reportType) {
     ...wParagraphsForText(question, 'BodyText'),
     wParagraph('Ответ ChatGPT', 'Heading1'),
     ...wParagraphsForText(answer, 'AnswerText'),
+    ...(warnings.length ? [
+      wParagraph('Предупреждения обработки', 'Heading1'),
+      ...warnings.flatMap(warning => wParagraphsForText(warning, 'BodyText'))
+    ] : []),
     wParagraph('Метки по дням', 'Heading1'),
     ...reportDaySectionsXml(payload, channels),
     wParagraph('Группы и камеры', 'Heading1'),
@@ -2603,7 +3196,8 @@ function reportDocxDocumentXml(payload, reportType) {
     wTable([
       ['Тип отчета', reportLabel],
       ['Получателей', String(normalizeEmailList(payload.recipients || '').length || 'из настроек')],
-      ['Фрагментов транскрипта', String(transcriptLines.length || payload.transcriptLines || 0)]
+      ['Фрагментов транскрипта', String(transcriptLines.length || payload.transcriptLines || 0)],
+      ['Предупреждений', String(warnings.length)]
     ], [2600, 6760], false)
   ];
 
@@ -3177,6 +3771,14 @@ async function sendSmtpMail(config, message) {
           error: publicError(error)
         });
 
+        if (error.deliveryUncertain) {
+          error.details = {
+            ...(error.details && typeof error.details === 'object' ? error.details : {}),
+            deliveryUncertain: true,
+            attempts
+          };
+          throw error;
+        }
         if (!isRetryableSmtpError(error)) {
           error.details = {
             ...(error.details && typeof error.details === 'object' ? error.details : {}),
@@ -3197,6 +3799,7 @@ async function sendSmtpMail(config, message) {
 async function sendSmtpMailOnce(config, message) {
   let socket = await openSmtpSocket(config);
   let reader = createSmtpReader(socket, config.timeoutMs);
+  let dataWritten = false;
 
   try {
     await reader.read([220]);
@@ -3222,8 +3825,9 @@ async function sendSmtpMailOnce(config, message) {
     }
     await reader.command('DATA', [354]);
 
-    const messageId = `${crypto.randomUUID()}@camera-audio-listener`;
+    const messageId = message.messageId || `${crypto.randomUUID()}@camera-audio-listener`;
     socket.write(`${smtpData(formatMailMessage(config, message, messageId))}\r\n.\r\n`);
+    dataWritten = true;
     const accepted = await reader.read([250]);
     await reader.command('QUIT', [221]).catch(() => null);
 
@@ -3231,6 +3835,15 @@ async function sendSmtpMailOnce(config, message) {
       messageId,
       smtpResponse: safePreview(accepted.raw, 600)
     };
+  } catch (error) {
+    if (dataWritten && !error?.details?.response) {
+      error.deliveryUncertain = true;
+      error.details = {
+        ...(error.details && typeof error.details === 'object' ? error.details : {}),
+        deliveryUncertain: true
+      };
+    }
+    throw error;
   } finally {
     reader.detach();
     socket.end();
@@ -5541,10 +6154,18 @@ function isExpectedDisconnect(error) {
 }
 
 export {
+  actionLastRunMatchesCandidate,
   buildReportDocxAttachment,
   isWeekendDatePart,
+  markActionSchedulerState,
   normalizeStoredAction,
+  reportMessageId,
+  resolveScheduledDailyDate,
   resolveScheduledWeeklyDates,
+  scheduledActionConfigHash,
   scheduledActionCandidates,
-  scheduledReportTypes
+  scheduledReportTypes,
+  scheduledRetryCandidates,
+  scheduledRetryDelayMs,
+  shouldRunScheduledCandidate
 };

@@ -123,6 +123,7 @@ let openAiRunId = 0;
 let liveTranscriptOffsetSeconds = 0;
 let storageHydrated = false;
 let storageAvailable = false;
+const actionRunNotices = new Map();
 
 applySettingsToControls();
 renderChannelButtons();
@@ -358,20 +359,25 @@ function renderOpenAiActions() {
     const run = action.lastRun || {};
     const stateClass = activeOpenAiActionId === action.id
       ? ' running'
-      : run.status === 'success'
+      : run.status === 'running' || run.status === 'queued'
+        ? ' running'
+        : run.status === 'success'
         ? ' success'
-        : run.status === 'error'
+        : run.status === 'error' || run.status === 'delivery_uncertain'
           ? ' error'
           : '';
     const groups = action.groupIds.map(groupId => groupById(groupId)?.name).filter(Boolean);
     const subtitle = actionPeriodSubtitle(action);
     const reports = actionReportLabels(action);
     const weekendMode = action.runOnWeekends ? 'обрабатывать' : 'пропускать';
+    const triggerNotice = actionRunNotices.get(action.id);
     const runSource = run.scheduled ? 'Авто · ' : '';
-    const lastLine = run.status
-      ? `${runSource}${run.status === 'success' ? 'Готово' : run.status === 'stopped' ? 'Остановлено' : 'Ошибка'}${run.at ? ` · ${formatTime(run.at)}` : ''}`
-      : 'Запусков пока нет';
-    const errorLine = run.status === 'error'
+    const lastLine = activeOpenAiActionId === action.id
+      ? 'Выполняется вручную'
+      : run.status
+        ? `${runSource}${run.status === 'success' ? 'Готово' : run.status === 'running' ? 'Выполняется' : run.status === 'queued' ? 'В очереди' : run.status === 'stopped' ? 'Остановлено' : run.status === 'delivery_uncertain' ? 'Доставка не подтверждена' : 'Ошибка'}${run.at ? ` · ${formatTime(run.at)}` : ''}`
+        : 'Запусков пока нет';
+    const errorLine = run.status === 'error' || run.status === 'delivery_uncertain'
       ? `${OPENAI_STAGE_LABELS[run.stage] || run.stage || 'Выполнение'}: ${run.error || 'без деталей'}`
       : '';
 
@@ -387,6 +393,7 @@ function renderOpenAiActions() {
         <div class="meta-line">Группы: ${escapeHtml(groups.length ? groups.join(', ') : 'не найдены')}</div>
         ${action.periodMode !== 'once' ? `<div class="meta-line">Выходные: ${weekendMode}</div>` : ''}
         ${reports.length ? `<div class="meta-line">Отчёты: ${escapeHtml(reports.join(', '))}</div>` : ''}
+        ${triggerNotice ? `<div class="meta-line${triggerNotice.error ? ' action-error-line' : ''}">${escapeHtml(triggerNotice.message)}</div>` : ''}
         ${errorLine ? `<div class="meta-line action-error-line">Ошибка: ${escapeHtml(errorLine)}</div>` : ''}
         <div class="meta-line">Вопрос: ${escapeHtml(action.question)}</div>
         <div class="card-actions">
@@ -797,7 +804,21 @@ function handleActionListClick(event) {
   if (!action) return;
 
   if (button.dataset.actionCommand === 'run') {
-    runOpenAiWorkflow(action);
+    if (action.periodMode !== 'once') {
+      void triggerScheduledOpenAiAction(action).catch(error => {
+        const message = `Ошибка запуска: ${error.message || error}`;
+        actionRunNotices.set(action.id, { message, error: true });
+        renderOpenAiActions();
+        setOpenAiStatus(message);
+        setTranscript(elements.openAiAnswer, elements.openAiAnswerStatus, message, 'Не запущено');
+        logError(error);
+      });
+    } else {
+      void runOpenAiWorkflow(action).catch(error => {
+        setOpenAiStatus(`Ошибка запуска: ${error.message || error}`);
+        logError(error);
+      });
+    }
     return;
   }
   if (button.dataset.actionCommand === 'edit') {
@@ -807,6 +828,40 @@ function handleActionListClick(event) {
   if (button.dataset.actionCommand === 'delete') {
     deleteAction(action.id);
   }
+}
+
+async function triggerScheduledOpenAiAction(action) {
+  actionRunNotices.set(action.id, { message: 'Ставлю действие в фоновую очередь…', error: false });
+  renderOpenAiActions();
+  setOpenAiStatus('Ставлю действие в фоновую очередь');
+  const data = await api('/api/storage/action-trigger', {
+    method: 'POST',
+    body: { actionId: action.id }
+  });
+  const status = data.status === 'running' ? 'running' : 'queued';
+  openAiActions = openAiActions.map(item => item.id === action.id
+    ? {
+        ...item,
+        lastRun: {
+          ...(item.lastRun || {}),
+          status,
+          scheduled: true,
+          at: new Date().toISOString(),
+          from: data.from || item.lastRun?.from || '',
+          to: data.to || item.lastRun?.to || '',
+          runKey: data.runKey || item.lastRun?.runKey || ''
+        }
+      }
+    : item);
+  renderOpenAiActions();
+  const message = data.message || (status === 'running'
+    ? 'Действие уже выполняется в фоне.'
+    : 'Действие поставлено в фоновую очередь.');
+  actionRunNotices.set(action.id, { message, error: false });
+  renderOpenAiActions();
+  setOpenAiStatus(message);
+  setTranscript(elements.openAiAnswer, elements.openAiAnswerStatus, message, status === 'running' ? 'Выполняется' : 'В очереди');
+  window.setTimeout(() => void refreshPersistedActionState(), 2500);
 }
 
 function deleteAction(actionId) {
@@ -902,7 +957,11 @@ function resolveDailyActionDate(action) {
     today: 0,
     tomorrow: 1
   }[action.dayPreset] ?? 0;
-  return offsetDatePart(toDateInputLocal(new Date()), offset);
+  let date = offsetDatePart(toDateInputLocal(new Date()), offset);
+  if (action.dayPreset === 'yesterday' && !action.runOnWeekends) {
+    while (isWeekendDatePart(date)) date = offsetDatePart(date, -1);
+  }
+  return date;
 }
 
 function resolveWeeklyActionDates(action) {
@@ -914,14 +973,15 @@ function updateActionLastRun(actionId, lastRun) {
   const action = actionById(actionId);
   openAiActions = openAiActions.map(action => action.id === actionId ? { ...action, lastRun } : action);
   saveOpenAiActions();
-  persistActionRun(action, lastRun);
+  const persistence = persistActionRun(action, lastRun);
   renderOpenAiActions();
+  return persistence;
 }
 
 function persistActionRun(action, lastRun) {
   if (!action || !lastRun?.status) return;
   const timestamp = lastRun.at || new Date().toISOString();
-  syncStorage('/api/storage/action-run', {
+  return syncStorage('/api/storage/action-run', {
     ...lastRun,
     actionId: action.id,
     actionName: action.name,
@@ -955,7 +1015,19 @@ async function runOpenAiWorkflow(action) {
     return;
   }
   if (!selections.length) {
-    setOpenAiStatus('В действии нет доступных групп');
+    const requestedDate = action.periodMode === 'daily' ? resolveDailyActionDate(action) : '';
+    const message = requestedDate && !action.runOnWeekends && isWeekendDatePart(requestedDate)
+      ? 'Период попадает на выходной. Включите обработку выходных или выберите другую дату.'
+      : 'В действии нет доступных групп или периодов.';
+    setOpenAiStatus(message);
+    setTranscript(elements.openAiAnswer, elements.openAiAnswerStatus, message, 'Не запущено');
+    await updateActionLastRun(action.id, {
+      status: 'error',
+      at: new Date().toISOString(),
+      error: message,
+      stage: 'search',
+      scheduled: false
+    });
     return;
   }
   if (!question) {
@@ -972,6 +1044,7 @@ async function runOpenAiWorkflow(action) {
   const progress = createOpenAiProgressState(action, selections);
   let answerData = null;
   let reportData = null;
+  let manualClaim = null;
 
   renderOpenAiActions();
   setOpenAiBusy(true);
@@ -981,6 +1054,18 @@ async function runOpenAiWorkflow(action) {
   elements.openAiAnswer.classList.add('is-empty');
 
   try {
+    manualClaim = await api('/api/storage/action-run/start', {
+      method: 'POST',
+      body: {
+        actionId: action.id,
+        periodMode: action.periodMode,
+        from: progress.from,
+        to: progress.to,
+        startedAt: new Date().toISOString()
+      },
+      signal
+    });
+
     for (const [selectionIndex, selection] of selections.entries()) {
       ensureOpenAiRun(runId, signal);
       const selectionLabel = `${selection.groupName} · ${channelLabel(selection.channel)}`;
@@ -1116,6 +1201,7 @@ async function runOpenAiWorkflow(action) {
           answerData,
           transcript: contextLines.join('\n'),
           reportTypes,
+          deliveryKey: manualClaim?.deliveryKey || '',
           signal
         });
         appendOpenAiRunLog(`Отчёт отправлен: ${reportTypes.map(reportTypeLabel).join(', ')}`);
@@ -1130,9 +1216,15 @@ async function runOpenAiWorkflow(action) {
 
     setOpenAiStage(progress, 'done', 'Готово');
     updateOpenAiProgressView(progress, 100);
-    updateActionLastRun(action.id, {
+    await updateActionLastRun(action.id, {
       status: 'success',
       at: new Date().toISOString(),
+      from: progress.from,
+      to: progress.to,
+      periodMode: action.periodMode,
+      scheduled: false,
+      runKey: manualClaim?.runKey || '',
+      deliveryKey: manualClaim?.deliveryKey || '',
       model: answerData.model || '',
       responseId: answerData.responseId || '',
       answer: answerData.answer || '',
@@ -1154,9 +1246,15 @@ async function runOpenAiWorkflow(action) {
       setOpenAiStatus('Остановлено');
       elements.openAiAnswerStatus.textContent = 'Остановлено';
       appendOpenAiRunLog('Остановлено пользователем');
-      updateActionLastRun(action.id, {
+      await updateActionLastRun(action.id, {
         status: 'stopped',
         at: new Date().toISOString(),
+        from: progress.from,
+        to: progress.to,
+        periodMode: action.periodMode,
+        scheduled: false,
+        runKey: manualClaim?.runKey || '',
+        deliveryKey: manualClaim?.deliveryKey || '',
         error: 'Остановлено пользователем'
       });
       return;
@@ -1182,17 +1280,31 @@ async function runOpenAiWorkflow(action) {
         'Не отправлялось'
       );
     }
-    updateActionLastRun(action.id, {
-      status: 'error',
+    const deliveryUncertain = Boolean(error?.details?.deliveryUncertain);
+    await updateActionLastRun(action.id, {
+      status: deliveryUncertain ? 'delivery_uncertain' : 'error',
       at: new Date().toISOString(),
+      from: progress.from,
+      to: progress.to,
+      periodMode: action.periodMode,
+      scheduled: false,
+      runKey: manualClaim?.runKey || '',
+      deliveryKey: manualClaim?.deliveryKey || '',
       error: error.message || String(error),
       stage: error.openAiContext?.stage || progress.stage,
       answer: answerData?.answer || '',
       model: answerData?.model || '',
-      responseId: answerData?.responseId || ''
+      responseId: answerData?.responseId || '',
+      details: error?.details
     });
     logError(error);
   } finally {
+    if (manualClaim?.runKey) {
+      await syncStorage('/api/storage/action-run/release', {
+        actionId: action.id,
+        runKey: manualClaim.runKey
+      }, { force: true });
+    }
     if (runId === openAiRunId) {
       openAiController = null;
       activeOpenAiActionId = null;
@@ -1212,6 +1324,7 @@ async function sendActionReports(options) {
     method: 'POST',
     body: {
       reportTypes: options.reportTypes,
+      deliveryKey: options.deliveryKey || '',
       recipients,
       generatedAt: new Date().toISOString(),
       from: options.progress.from,
