@@ -6,6 +6,9 @@ const OPENAI_STAGE_LABELS = {
   idle: 'Ожидает',
   search: 'Поиск записей',
   transcribe: 'Транскрибация',
+  transcript: 'Подготовка аудио и транскрибация',
+  queued: 'В очереди',
+  stopping: 'Останавливается',
   ask: 'Запрос OpenAI',
   report: 'Отправка отчёта',
   done: 'Готово',
@@ -112,6 +115,7 @@ let openAiActions = loadOpenAiActions();
 let editingGroupId = null;
 let editingActionId = null;
 let activeOpenAiActionId = null;
+let activeOpenAiActionStartedAt = null;
 let lastRecordings = [];
 let lastArchiveItem = null;
 let liveTranscriptController = null;
@@ -124,6 +128,10 @@ let liveTranscriptOffsetSeconds = 0;
 let storageHydrated = false;
 let storageAvailable = false;
 const actionRunNotices = new Map();
+const pendingActionCommands = new Map();
+let schedulerState = null;
+let schedulerClockOffset = 0;
+let actionStateRefreshing = false;
 
 applySettingsToControls();
 renderChannelButtons();
@@ -140,7 +148,8 @@ resetOpenAiProgressView();
 selectChannel(selectedChannel, { quiet: true });
 loadPersistedState().finally(() => {
   loadHealth();
-  window.setInterval(refreshPersistedActionState, 30000);
+  window.setInterval(refreshPersistedActionState, 3000);
+  window.setInterval(updateActionCountdowns, 1000);
 });
 
 elements.channelGrid.addEventListener('click', event => {
@@ -356,10 +365,19 @@ function renderOpenAiActions() {
   }
 
   elements.openAiActionList.innerHTML = openAiActions.map(action => {
-    const run = action.lastRun || {};
+    const schedule = schedulerState?.schedules?.[action.id];
+    const run = schedule?.run || action.lastRun || {};
+    const lastStartedAt = activeOpenAiActionId === action.id
+      ? activeOpenAiActionStartedAt
+      : run.startedAt || (run.status === 'running' ? run.at : '');
+    const busy = isActionBusy(action.id);
+    const stopping = pendingActionCommands.get(action.id) === 'stop' || schedule?.state === 'stopping';
+    const background = busy && activeOpenAiActionId !== action.id;
+    const queued = pendingActionCommands.get(action.id) === 'run' || schedule?.state === 'queued';
+    const percent = queued ? 0 : clamp(Number(run.progress?.percent || 0), 0, 100);
     const stateClass = activeOpenAiActionId === action.id
       ? ' running'
-      : run.status === 'running' || run.status === 'queued'
+      : busy
         ? ' running'
         : run.status === 'success'
         ? ' success'
@@ -372,17 +390,19 @@ function renderOpenAiActions() {
     const weekendMode = action.runOnWeekends ? 'обрабатывать' : 'пропускать';
     const triggerNotice = actionRunNotices.get(action.id);
     const runSource = run.scheduled ? 'Авто · ' : '';
-    const lastLine = activeOpenAiActionId === action.id
+    const lastLine = background
+      ? stopping ? 'Останавливается в фоне' : queued ? 'В фоновой очереди' : 'Выполняется в фоне'
+      : activeOpenAiActionId === action.id
       ? 'Выполняется вручную'
-      : run.status
+      : run.status && !['running', 'queued'].includes(run.status)
         ? `${runSource}${run.status === 'success' ? 'Готово' : run.status === 'running' ? 'Выполняется' : run.status === 'queued' ? 'В очереди' : run.status === 'stopped' ? 'Остановлено' : run.status === 'delivery_uncertain' ? 'Доставка не подтверждена' : 'Ошибка'}${run.at ? ` · ${formatTime(run.at)}` : ''}`
-        : 'Запусков пока нет';
-    const errorLine = run.status === 'error' || run.status === 'delivery_uncertain'
+        : 'Ожидает запуска';
+    const errorLine = !busy && (run.status === 'error' || run.status === 'delivery_uncertain')
       ? `${OPENAI_STAGE_LABELS[run.stage] || run.stage || 'Выполнение'}: ${run.error || 'без деталей'}`
       : '';
 
     return `
-      <article class="action-card${stateClass}" data-action-id="${escapeHtml(action.id)}">
+      <article class="action-card${stateClass}" data-action-id="${escapeHtml(action.id)}" aria-busy="${busy}">
         <div class="card-title-row">
           <div>
             <strong>${escapeHtml(action.name || 'Действие')}</strong>
@@ -391,19 +411,80 @@ function renderOpenAiActions() {
           <span class="action-state">${escapeHtml(lastLine)}</span>
         </div>
         <div class="meta-line">Группы: ${escapeHtml(groups.length ? groups.join(', ') : 'не найдены')}</div>
+        <div class="meta-line action-last-start">Последний старт: ${lastStartedAt ? `<time datetime="${escapeHtml(lastStartedAt)}">${escapeHtml(formatScheduledTime(lastStartedAt))}</time> (ЕКБ)` : run.status ? 'время не сохранено' : 'ещё не запускалось'}</div>
         ${action.periodMode !== 'once' ? `<div class="meta-line">Выходные: ${weekendMode}</div>` : ''}
         ${reports.length ? `<div class="meta-line">Отчёты: ${escapeHtml(reports.join(', '))}</div>` : ''}
+        <div class="action-countdown meta-line" data-action-countdown="${escapeHtml(action.id)}"></div>
         ${triggerNotice ? `<div class="meta-line${triggerNotice.error ? ' action-error-line' : ''}">${escapeHtml(triggerNotice.message)}</div>` : ''}
         ${errorLine ? `<div class="meta-line action-error-line">Ошибка: ${escapeHtml(errorLine)}</div>` : ''}
+        ${background ? `
+          <div class="action-background-progress">
+            <div class="action-progress-heading">
+              <span>${escapeHtml(stopping ? (run.stage === 'report' ? 'Завершение текущей отправки письма' : 'Остановка обработки') : queued ? 'Ожидание свободной очереди' : OPENAI_STAGE_LABELS[run.stage] || 'Подготовка запуска')}</span>
+              <strong>${percent.toLocaleString('ru-RU', { maximumFractionDigits: 1 })}%</strong>
+            </div>
+            <progress class="action-progress-bar" max="100" value="${percent}" aria-label="Выполнение действия ${escapeHtml(action.name)}">${percent}%</progress>
+            ${run.progress?.label ? `<div class="meta-line">${escapeHtml(run.progress.label)}</div>` : ''}
+            ${run.progress?.from ? `<div class="meta-line">${escapeHtml(formatScheduledTime(run.progress.from))} - ${escapeHtml(formatScheduledTime(run.progress.to))}</div>` : ''}
+            <div class="meta-line">Частей: ${Number(run.progress?.completedChunks) || 0} · Аудио: ${formatDurationLabel(run.progress?.transcribedSeconds || 0)} · Записей: ${Number(run.progress?.completedRecordings) || 0}/${Number(run.progress?.knownRecordings) || 0}</div>
+          </div>` : ''}
+        ${run.errorNotification?.status === 'sent' ? '<div class="meta-line">Уведомление об ошибке отправлено на почту</div>' : ''}
+        ${run.errorNotification && run.errorNotification.status !== 'sent' ? `<div class="meta-line action-error-line">Уведомление об ошибке: ${escapeHtml(run.errorNotification.error || run.errorNotification.reason || 'доставка не подтверждена')}</div>` : ''}
         <div class="meta-line">Вопрос: ${escapeHtml(action.question)}</div>
         <div class="card-actions">
+          ${busy ? `<button class="inline danger" type="button" data-action-command="stop" data-action-id="${escapeHtml(action.id)}" ${stopping || pendingActionCommands.get(action.id) === 'run' ? 'disabled' : ''}>${stopping ? 'Останавливается…' : 'Остановить'}</button>` : `
           <button class="inline" type="button" data-action-command="run" data-action-id="${escapeHtml(action.id)}">Запустить</button>
           <button class="inline file" type="button" data-action-command="edit" data-action-id="${escapeHtml(action.id)}">Изменить</button>
           <button class="inline danger" type="button" data-action-command="delete" data-action-id="${escapeHtml(action.id)}">Удалить</button>
+          `}
         </div>
       </article>
     `;
   }).join('');
+  updateActionCountdowns();
+}
+
+function isActionBusy(actionId) {
+  return activeOpenAiActionId === actionId || pendingActionCommands.has(actionId)
+    || ['queued', 'running', 'stopping'].includes(schedulerState?.schedules?.[actionId]?.state);
+}
+
+function applySchedulerState(value) {
+  if (!value) return;
+  schedulerState = value;
+  const serverTime = Date.parse(value.serverNow);
+  if (Number.isFinite(serverTime)) schedulerClockOffset = serverTime - Date.now();
+}
+
+function formatScheduledTime(value) {
+  const hasZone = /(?:Z|[+-]\d\d:\d\d)$/.test(String(value || ''));
+  const date = new Date(hasZone ? value : `${value}+05:00`);
+  return Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('ru-RU', {
+    timeZone: schedulerState?.timeZone || 'Asia/Yekaterinburg', dateStyle: 'short', timeStyle: 'medium'
+  }).format(date) : String(value || '');
+}
+
+function updateActionCountdowns() {
+  for (const element of elements.openAiActionList.querySelectorAll('[data-action-countdown]')) {
+    const action = actionById(element.dataset.actionCountdown);
+    if (!action) continue;
+    const schedule = schedulerState?.schedules?.[action.id];
+    element.hidden = isActionBusy(action.id);
+    if (element.hidden) continue;
+    const nextAt = Date.parse(schedule?.nextRunAt || '');
+    if (action.periodMode === 'once') element.textContent = 'Только ручной запуск';
+    else if (!schedulerState) element.textContent = 'Расписание загружается…';
+    else if (!schedulerState.enabled) element.textContent = 'Фоновый планировщик выключен';
+    else if (!Number.isFinite(nextAt)) element.textContent = 'Нет следующего фонового запуска';
+    else {
+      const seconds = Math.max(0, Math.ceil((nextAt - Date.now() - schedulerClockOffset) / 1000));
+      const days = Math.floor(seconds / 86400);
+      const clock = [Math.floor(seconds / 3600) % 24, Math.floor(seconds / 60) % 60, seconds % 60]
+        .map(number => String(number).padStart(2, '0')).join(':');
+      element.textContent = seconds ? `До запуска в фоне: ${days ? `${days} д. ` : ''}${clock}` : 'Ожидает запуска в фоновой очереди';
+      element.title = `Следующий запуск: ${formatScheduledTime(schedule.nextRunAt)} (${schedulerState.timeZone || 'Asia/Yekaterinburg'})`;
+    }
+  }
 }
 
 function renderActionGroupPicker(selectedGroupIds = []) {
@@ -725,6 +806,8 @@ function deleteGroup(groupId) {
 }
 
 function openActionDialog(action = null) {
+  if (action && isActionBusy(action.id)) return;
+  elements.saveActionButton.disabled = false;
   editingActionId = action?.id || null;
   elements.actionDialogTitle.textContent = action ? 'Изменить действие' : 'Создать действие';
   elements.actionName.value = action?.name || '';
@@ -771,6 +854,10 @@ function saveActionFromDialog() {
   }
 
   const previous = editingActionId ? openAiActions.find(action => action.id === editingActionId) : null;
+  if (editingActionId && isActionBusy(editingActionId)) {
+    setOpenAiStatus('Сначала остановите фоновое действие');
+    return;
+  }
   const action = {
     id: editingActionId || createId('action'),
     name,
@@ -802,6 +889,16 @@ function handleActionListClick(event) {
 
   const action = actionById(button.dataset.actionId);
   if (!action) return;
+  if (button.disabled) return;
+  if (button.dataset.actionCommand === 'stop') {
+    if (activeOpenAiActionId === action.id) stopOpenAiWorkflow();
+    else void stopScheduledAction(action).catch(error => {
+      actionRunNotices.set(action.id, { message: `Ошибка остановки: ${error.message}`, error: true });
+      renderOpenAiActions();
+    });
+    return;
+  }
+  if (isActionBusy(action.id)) return;
 
   if (button.dataset.actionCommand === 'run') {
     if (action.periodMode !== 'once') {
@@ -831,40 +928,43 @@ function handleActionListClick(event) {
 }
 
 async function triggerScheduledOpenAiAction(action) {
-  actionRunNotices.set(action.id, { message: 'Ставлю действие в фоновую очередь…', error: false });
+  pendingActionCommands.set(action.id, 'run');
+  try {
+    actionRunNotices.set(action.id, { message: 'Ставлю действие в фоновую очередь…', error: false });
+    renderOpenAiActions();
+    const data = await api('/api/storage/action-trigger', { method: 'POST', body: { actionId: action.id } });
+    const status = ['running', 'stopping'].includes(data.status) ? data.status : 'queued';
+    schedulerState ||= { schedules: {} };
+    schedulerState.schedules ||= {};
+    schedulerState.schedules[action.id] = { state: status, run: null };
+    const message = data.message || 'Действие поставлено в фоновую очередь.';
+    actionRunNotices.set(action.id, { message, error: false });
+    setOpenAiStatus(message);
+    setTranscript(elements.openAiAnswer, elements.openAiAnswerStatus, message, OPENAI_STAGE_LABELS[status] || 'Выполняется');
+  } finally {
+    pendingActionCommands.delete(action.id);
+    await refreshPersistedActionState();
+    renderOpenAiActions();
+  }
+}
+
+async function stopScheduledAction(action) {
+  pendingActionCommands.set(action.id, 'stop');
   renderOpenAiActions();
-  setOpenAiStatus('Ставлю действие в фоновую очередь');
-  const data = await api('/api/storage/action-trigger', {
-    method: 'POST',
-    body: { actionId: action.id }
-  });
-  const status = data.status === 'running' ? 'running' : 'queued';
-  openAiActions = openAiActions.map(item => item.id === action.id
-    ? {
-        ...item,
-        lastRun: {
-          ...(item.lastRun || {}),
-          status,
-          scheduled: true,
-          at: new Date().toISOString(),
-          from: data.from || item.lastRun?.from || '',
-          to: data.to || item.lastRun?.to || '',
-          runKey: data.runKey || item.lastRun?.runKey || ''
-        }
-      }
-    : item);
-  renderOpenAiActions();
-  const message = data.message || (status === 'running'
-    ? 'Действие уже выполняется в фоне.'
-    : 'Действие поставлено в фоновую очередь.');
-  actionRunNotices.set(action.id, { message, error: false });
-  renderOpenAiActions();
-  setOpenAiStatus(message);
-  setTranscript(elements.openAiAnswer, elements.openAiAnswerStatus, message, status === 'running' ? 'Выполняется' : 'В очереди');
-  window.setTimeout(() => void refreshPersistedActionState(), 2500);
+  try {
+    const result = await api('/api/storage/action-stop', { method: 'POST', body: { actionId: action.id } });
+    const schedule = schedulerState?.schedules?.[action.id];
+    if (schedule) schedule.state = result.status;
+    actionRunNotices.delete(action.id);
+  } finally {
+    pendingActionCommands.delete(action.id);
+    await refreshPersistedActionState();
+    renderOpenAiActions();
+  }
 }
 
 function deleteAction(actionId) {
+  if (isActionBusy(actionId)) return;
   openAiActions = openAiActions.filter(action => action.id !== actionId);
   if (activeOpenAiActionId === actionId) {
     stopOpenAiWorkflow();
@@ -1039,6 +1139,8 @@ async function runOpenAiWorkflow(action) {
   openAiRunId = runId;
   openAiController = new AbortController();
   activeOpenAiActionId = action.id;
+  const startedAt = new Date().toISOString();
+  activeOpenAiActionStartedAt = startedAt;
   const signal = openAiController.signal;
   const contextLines = [];
   const progress = createOpenAiProgressState(action, selections);
@@ -1061,7 +1163,7 @@ async function runOpenAiWorkflow(action) {
         periodMode: action.periodMode,
         from: progress.from,
         to: progress.to,
-        startedAt: new Date().toISOString()
+        startedAt
       },
       signal
     });
@@ -1218,6 +1320,7 @@ async function runOpenAiWorkflow(action) {
     updateOpenAiProgressView(progress, 100);
     await updateActionLastRun(action.id, {
       status: 'success',
+      startedAt,
       at: new Date().toISOString(),
       from: progress.from,
       to: progress.to,
@@ -1248,6 +1351,7 @@ async function runOpenAiWorkflow(action) {
       appendOpenAiRunLog('Остановлено пользователем');
       await updateActionLastRun(action.id, {
         status: 'stopped',
+        startedAt,
         at: new Date().toISOString(),
         from: progress.from,
         to: progress.to,
@@ -1283,6 +1387,7 @@ async function runOpenAiWorkflow(action) {
     const deliveryUncertain = Boolean(error?.details?.deliveryUncertain);
     await updateActionLastRun(action.id, {
       status: deliveryUncertain ? 'delivery_uncertain' : 'error',
+      startedAt,
       at: new Date().toISOString(),
       from: progress.from,
       to: progress.to,
@@ -1308,6 +1413,7 @@ async function runOpenAiWorkflow(action) {
     if (runId === openAiRunId) {
       openAiController = null;
       activeOpenAiActionId = null;
+      activeOpenAiActionStartedAt = null;
       setOpenAiBusy(false);
       renderOpenAiActions();
     }
@@ -1691,6 +1797,7 @@ async function loadPersistedState() {
   try {
     const data = await api('/api/storage');
     storageAvailable = true;
+    applySchedulerState(data.scheduler);
 
     if (data.settings && typeof data.settings === 'object') {
       uiSettings = { ...uiSettings, ...data.settings };
@@ -1733,32 +1840,29 @@ async function loadPersistedState() {
 }
 
 async function refreshPersistedActionState() {
-  if (!storageHydrated || !storageAvailable || activeOpenAiActionId || elements.actionDialog?.open || editingGroupId) return;
+  if (!storageHydrated || actionStateRefreshing) return;
+  actionStateRefreshing = true;
 
   try {
-    const data = await api('/api/storage');
-    if (Array.isArray(data.channelLabels) && data.channelLabels.length) {
-      channelLabels = mergeStoredChannelLabels(data.channelLabels);
-      localStorage.setItem(STORAGE_KEYS.channelLabels, JSON.stringify(channelLabels));
-    }
-    if (Array.isArray(data.groups)) {
-      openAiGroups = data.groups.map(normalizeOpenAiGroup).filter(Boolean);
-      localStorage.setItem(STORAGE_KEYS.openAiGroups, JSON.stringify(openAiGroups));
-    }
+    const data = await api('/api/storage/action-status');
+    const before = JSON.stringify([openAiActions, schedulerState?.schedules]);
+    applySchedulerState(data.scheduler);
     if (Array.isArray(data.actions)) {
-      openAiActions = data.actions.map(normalizeOpenAiAction).filter(Boolean);
+      openAiActions = data.actions.map(action => action.id === activeOpenAiActionId ? actionById(action.id) : normalizeOpenAiAction(action)).filter(Boolean);
       localStorage.setItem(STORAGE_KEYS.openAiActions, JSON.stringify(openAiActions));
     }
-
-    renderChannelButtons();
-    renderChannelNameFields();
-    renderOpenAiGroups();
-    renderOpenAiActions();
-    renderActionGroupPicker(selectedActionDialogGroupIds());
+    for (const [id, notice] of actionRunNotices) {
+      if (!notice.error && !pendingActionCommands.has(id)) actionRunNotices.delete(id);
+    }
+    if (before !== JSON.stringify([openAiActions, schedulerState?.schedules])) renderOpenAiActions();
+    else updateActionCountdowns();
+    if (editingActionId) elements.saveActionButton.disabled = isActionBusy(editingActionId);
     storageAvailable = true;
   } catch (error) {
     storageAvailable = false;
     console.warn('Storage refresh failed:', error);
+  } finally {
+    actionStateRefreshing = false;
   }
 }
 
