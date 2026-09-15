@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import pg from 'pg';
 import { createTranscriptionModelSettings } from './transcription-models.mjs';
+import { ProxyAgent } from 'undici';
 
 const { Client, Pool } = pg;
 
@@ -20,6 +21,8 @@ const RUNTIME_DIR = path.join(__dirname, '.runtime');
 const TRANSCRIPT_DIR = path.join(process.env.TEMP || process.env.TMP || RUNTIME_DIR, 'camera-audio-listener-transcripts');
 const GIGAAM_WORKER_SCRIPT = path.join(__dirname, 'scripts', 'gigaam_worker.py');
 const GIGAAM_SETUP_SCRIPT = path.join(__dirname, 'scripts', 'prepare_transcription.py');
+const VPNXXX_AUTO_PROXY_URL = 'vpnxxx://auto';
+const VPNXXX_PRIVOXY_CONFIG_MAX_BYTES = 64 * 1024;
 
 loadDotEnv(path.join(__dirname, '.env'));
 
@@ -36,6 +39,7 @@ const ACTION_SCHEDULER_RETRY_MAX_AGE_MS = Math.max(1, numberFromEnv('ACTION_SCHE
 const MANUAL_ACTION_CLAIM_TTL_MS = Math.max(1, numberFromEnv('MANUAL_ACTION_CLAIM_TTL_HOURS', 36)) * 60 * 60 * 1000;
 let gigaAmWorkerState = null;
 let gigaAmWorkerError = '';
+let gigaAmTranscriptionQueue = Promise.resolve();
 let transcriberCheckPromise = null;
 let transcriberCheckKey = '';
 let transcriptionPythonPath = '';
@@ -46,6 +50,7 @@ let actionSchedulerTimer = null;
 let actionSchedulerRunning = false;
 let actionSchedulerStateMutation = Promise.resolve();
 const activeScheduledActions = new Set();
+const scheduledActionRuntime = new Map();
 const activeManualActions = new Map();
 let activeTranscriptionRequests = 0;
 const transcriptionModelSettings = createTranscriptionModelSettings({
@@ -102,6 +107,12 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/storage') {
       return await storageState(req, res, url.searchParams);
+    }
+
+    if (url.pathname === '/api/storage/action-status') {
+      requireMethod(req, 'GET');
+      const [actions, groups] = await Promise.all([readOpenAiActions(), readOpenAiGroups()]);
+      return json(res, 200, { ok: true, actions, scheduler: await readPublicActionSchedulerState(actions, groups) });
     }
 
     if (url.pathname.startsWith('/api/storage/')) {
@@ -241,6 +252,7 @@ function cameraConfig() {
     gigaamDownloadRoot: process.env.GIGAAM_DOWNLOAD_ROOT || defaultGigaAmDownloadRoot(),
     transcriptionChunkSeconds: numberFromEnv('TRANSCRIPTION_CHUNK_SECONDS', 20),
     transcriptionLiveSeconds: numberFromEnv('TRANSCRIPTION_LIVE_SECONDS', 18),
+    transcriptionCaptureChunkSeconds: numberFromEnv('TRANSCRIPTION_CAPTURE_CHUNK_SECONDS', 30),
     transcriptionArchiveMaxSeconds: numberFromEnv('TRANSCRIPTION_ARCHIVE_MAX_SECONDS', 0),
     transcriptionTimeoutMs: numberFromEnv('TRANSCRIPTION_TIMEOUT_MS', 30 * 60 * 1000),
     transcriptionCaptureTimeoutMs: numberFromEnv('TRANSCRIPTION_CAPTURE_TIMEOUT_MS', 30 * 60 * 1000)
@@ -279,11 +291,13 @@ function publicConfig() {
       device: config.gigaamDevice,
       chunkSeconds: config.transcriptionChunkSeconds,
       liveSeconds: config.transcriptionLiveSeconds,
+      captureChunkSeconds: archiveCaptureChunkSeconds(config),
       archiveMaxSeconds: config.transcriptionArchiveMaxSeconds
     },
     openAi: {
       hasApiKey: Boolean(process.env.OPENAI_API_KEY),
-      model: process.env.OPENAI_MODEL || 'gpt-5.6-terra'
+      model: process.env.OPENAI_MODEL || 'gpt-5.6-terra',
+      proxyEnabled: Boolean(process.env.OPENAI_PROXY_URL?.trim())
     },
     reports: publicEmailConfig(),
     database: publicDatabaseConfig(),
@@ -530,6 +544,7 @@ function quoteIdentifier(value) {
 
 async function storageState(req, res, params) {
   requireMethod(req, 'GET');
+  const [actions, groups] = await Promise.all([readOpenAiActions(), readOpenAiGroups()]);
   const transcripts = params.get('transcripts') === '1'
     ? await listTranscriptBlocks(params)
     : [];
@@ -539,9 +554,9 @@ async function storageState(req, res, params) {
     settings: await readAppSetting('ui_settings'),
     selectedChannel: await readAppSetting('selected_channel'),
     channelLabels: await readChannelLabels(),
-    groups: await readOpenAiGroups(),
-    actions: await readOpenAiActions(),
-    scheduler: await readPublicActionSchedulerState(),
+    groups,
+    actions,
+    scheduler: await readPublicActionSchedulerState(actions, groups),
     openAiJobs: [],
     transcripts
   });
@@ -581,6 +596,10 @@ async function storageMutation(req, res, pathname) {
       ok: true,
       ...await triggerScheduledOpenAiAction(payload)
     });
+  }
+
+  if (pathname === '/api/storage/action-stop') {
+    return json(res, 200, { ok: true, ...await stopScheduledOpenAiAction(payload) });
   }
 
   if (pathname === '/api/storage/action-run/start') {
@@ -730,6 +749,7 @@ async function readOpenAiActions() {
 
 async function replaceOpenAiActions(actions) {
   const normalized = Array.isArray(actions) ? actions.map(normalizeStoredAction).filter(Boolean) : [];
+  assertScheduledActionsEditable(normalized);
   await dbTransaction(async client => {
     const ids = normalized.map(action => action.id);
     if (ids.length) {
@@ -753,7 +773,6 @@ async function replaceOpenAiActions(actions) {
              report_daily = excluded.report_daily,
              report_weekly = excluded.report_weekly,
              run_on_weekends = excluded.run_on_weekends,
-             last_run = excluded.last_run,
              updated_at = now()`,
         [
           action.id,
@@ -1015,36 +1034,49 @@ async function runActionSchedulerTick() {
     for (const action of actions) {
       const actionState = schedulerState.actions?.[action.id];
       const candidates = uniqueScheduledCandidates([
+        ...(scheduledActionRuntime.get(action.id)?.status === 'queued' ? [scheduledActionRuntime.get(action.id).candidate] : []),
         ...scheduledRetryCandidates(action, groupMap, actionState, now),
         ...scheduledActionCandidates(action, groupMap, now)
       ]);
       for (const candidate of candidates) {
-        if (actionLastRunMatchesCandidate(action.lastRun, candidate)) continue;
+        const queued = scheduledActionRuntime.get(action.id);
+        const explicitlyQueued = queued?.status === 'queued' && queued.candidate.runKey === candidate.runKey;
+        if (!explicitlyQueued && actionLastRunMatchesCandidate(action.lastRun, candidate)) continue;
         const liveSchedulerState = await readActionSchedulerState();
         const modeState = liveSchedulerState.actions?.[action.id]?.[candidate.periodMode];
         const candidateState = scheduledCandidateState(modeState, candidate.runKey, candidate);
-        if (!shouldRunScheduledCandidate(candidateState, candidate, now)) continue;
+        if (!shouldRunScheduledCandidate(candidateState, candidate, new Date())) continue;
 
         const activeKey = `${action.id}:${candidate.runKey}`;
         if (activeScheduledActions.has(activeKey)) continue;
         if (manualActionClaim(activeKey)) continue;
 
+        const runtime = scheduledActionRuntime.get(action.id) || { candidate, controller: new AbortController() };
+        if (runtime.controller.signal.aborted) continue;
+        runtime.status = 'running';
+        runtime.candidate = candidate;
+        scheduledActionRuntime.set(action.id, runtime);
         activeScheduledActions.add(activeKey);
         let lastRun;
         try {
           lastRun = await runScheduledOpenAiAction(candidate, {
             settings,
-            labels
+            labels,
+            signal: runtime.controller.signal,
+            runtime
           });
         } catch (error) {
-          lastRun = await persistScheduledActionFailure(candidate, error);
+          lastRun = await persistScheduledActionFailure(candidate, error, { signal: runtime.controller.signal });
         } finally {
           activeScheduledActions.delete(activeKey);
         }
 
-        await mutateActionSchedulerState(state => {
-          markActionSchedulerState(state, candidate, lastRun);
-        });
+        try {
+          await mutateActionSchedulerState(state => markActionSchedulerState(state, candidate, lastRun));
+        } finally {
+          scheduledActionRuntime.delete(action.id);
+        }
+        if (lastRun.status === 'stopped') break;
       }
     }
   } finally {
@@ -1055,6 +1087,8 @@ async function runActionSchedulerTick() {
 async function triggerScheduledOpenAiAction(payload) {
   const actionId = String(payload?.actionId || '').trim();
   if (!actionId) throw httpError(400, 'Action id is required.');
+  const existing = scheduledActionRuntime.get(actionId);
+  if (existing) return { status: existing.status, runKey: existing.candidate.runKey, message: 'Действие уже в фоновой очереди.' };
 
   const activePrefix = `${actionId}:`;
   const activeRunKey = [...activeScheduledActions].find(key => key.startsWith(activePrefix));
@@ -1089,7 +1123,7 @@ async function triggerScheduledOpenAiAction(payload) {
   ]);
   const preferredRunKey = String(action.lastRun?.runKey || '');
   const runnableCandidates = candidates.filter(item => {
-      if (actionLastRunMatchesCandidate(action.lastRun, item)) return false;
+      if (action.lastRun?.status !== 'stopped' && actionLastRunMatchesCandidate(action.lastRun, item)) return false;
       const modeState = actionState?.[item.periodMode];
       const itemState = scheduledCandidateState(modeState, item.runKey, item);
       return !itemState || (itemState.status !== 'success' && itemState.status !== 'delivery_uncertain');
@@ -1104,9 +1138,15 @@ async function triggerScheduledOpenAiAction(payload) {
     throw httpError(409, 'Сейчас нет завершённого периода или ошибки, которую можно запустить повторно.');
   }
 
-  await mutateActionSchedulerState(state => {
-    forceScheduledCandidateRetry(state, candidate, now);
-  });
+  // Reserve before awaiting storage so simultaneous clicks cannot queue two runs.
+  if (scheduledActionRuntime.has(actionId)) return { status: scheduledActionRuntime.get(actionId).status };
+  scheduledActionRuntime.set(actionId, { candidate, status: 'queued', controller: new AbortController() });
+  try {
+    await mutateActionSchedulerState(state => forceScheduledCandidateRetry(state, candidate, now));
+  } catch (error) {
+    scheduledActionRuntime.delete(actionId);
+    throw error;
+  }
   const timer = setTimeout(() => {
     runActionSchedulerTick().catch(error => {
       console.warn(`Manual scheduler trigger failed: ${publicError(error)}`);
@@ -1126,7 +1166,13 @@ async function triggerScheduledOpenAiAction(payload) {
 function forceScheduledCandidateRetry(state, candidate, now = new Date()) {
   const actionState = state.actions?.[candidate.action.id];
   const modeState = actionState?.[candidate.periodMode];
-  if (!modeState || typeof modeState !== 'object') return;
+  if (!modeState || typeof modeState !== 'object' || scheduledCandidateState(modeState, candidate.runKey)?.status === 'stopped') {
+    markActionSchedulerState(state, candidate, { status: 'queued', at: now.toISOString() }, now);
+    const next = state.actions[candidate.action.id][candidate.periodMode];
+    next.nextRetryAt = now.toISOString();
+    next.pending.forEach(item => { if (item.runKey === candidate.runKey) item.nextRetryAt = now.toISOString(); });
+    return;
+  }
   const retryAt = now.toISOString();
   const pending = scheduledPendingStates(modeState).map(item => item.runKey === candidate.runKey
     ? { ...item, attempts: 0, firstAttemptAt: retryAt, nextRetryAt: retryAt }
@@ -1141,14 +1187,82 @@ function forceScheduledCandidateRetry(state, candidate, now = new Date()) {
   };
 }
 
-async function readPublicActionSchedulerState() {
+async function stopScheduledOpenAiAction(payload, services = {}) {
+  const runtimes = services.runtimes || scheduledActionRuntime;
+  const actionId = String(payload?.actionId || '');
+  const runtime = runtimes.get(actionId);
+  if (!runtime) throw httpError(409, 'Действие сейчас не выполняется в фоне.');
+  if (runtime.status === 'stopping') return { status: 'stopping' };
+  const wasQueued = runtime.status === 'queued';
+  runtime.status = 'stopping';
+  runtime.controller.abort();
+  if (wasQueued) {
+    const run = { status: 'stopped', scheduled: true, at: new Date().toISOString(), runKey: runtime.candidate.runKey, stage: 'queued' };
+    await (services.persistRun || persistScheduledActionRun)(runtime.candidate, run);
+    await (services.mutateScheduler || mutateActionSchedulerState)(state => markActionSchedulerState(state, runtime.candidate, run));
+    runtimes.delete(actionId);
+    return { status: 'stopped' };
+  }
+  return { status: 'stopping' };
+}
+
+function assertScheduledActionsEditable(actions, runtimes = scheduledActionRuntime) {
+  for (const [id, runtime] of runtimes) {
+    const next = actions.find(action => action.id === id);
+    const definition = action => {
+      const { lastRun, createdAt, ...fields } = normalizeStoredAction(action);
+      return JSON.stringify(fields);
+    };
+    if (!next || definition(next) !== definition(runtime.candidate.action)) {
+      throw httpError(409, 'Сначала остановите фоновое действие, затем изменяйте или удаляйте его.');
+    }
+  }
+}
+
+async function readPublicActionSchedulerState(actions = [], groups = []) {
   const state = await readActionSchedulerState().catch(() => ({ actions: {} }));
+  const enabled = ACTION_SCHEDULER_ENABLED && databaseConfig().enabled;
+  const now = new Date();
+  const groupMap = new Map(groups.map(group => [group.id, group]));
   return {
-    enabled: ACTION_SCHEDULER_ENABLED && databaseConfig().enabled,
+    enabled,
     running: actionSchedulerRunning,
+    serverNow: now.toISOString(),
+    timeZone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
     intervalSeconds: Math.round(ACTION_SCHEDULER_INTERVAL_MS / 1000),
-    actions: state.actions || {}
+    actions: state.actions || {},
+    schedules: Object.fromEntries(actions.map(action => {
+      const runtime = scheduledActionRuntime.get(action.id);
+      const next = enabled && !runtime ? nextScheduledActionRun(action, groupMap, state.actions?.[action.id], now) : null;
+      return [action.id, {
+        state: runtime?.status || (next && Date.parse(next.nextRunAt) <= now.getTime() ? 'waiting' : 'idle'),
+        nextRunAt: next?.nextRunAt || '',
+        periodMode: runtime?.candidate.periodMode || next?.periodMode || '',
+        run: runtime?.lastRun || null
+      }];
+    }))
   };
+}
+
+function nextScheduledActionRun(action, groupMap, actionState, now = new Date()) {
+  if (action.periodMode === 'once') return null;
+  const upcoming = [];
+  const consider = (candidate, earliest) => {
+    if (actionLastRunMatchesCandidate(action.lastRun, candidate)) return;
+    const state = scheduledCandidateState(actionState?.[candidate.periodMode], candidate.runKey, candidate);
+    const at = Math.max(earliest, Date.parse(state?.nextRetryAt || '') || 0);
+    if (!shouldRunScheduledCandidate(state, candidate, new Date(at))) return;
+    upcoming.push({ nextRunAt: new Date(at).toISOString(), periodMode: candidate.periodMode, runKey: candidate.runKey });
+  };
+  for (const candidate of scheduledRetryCandidates(action, groupMap, actionState, now)) consider(candidate, now.getTime());
+  for (let day = 0; day <= 14; day += 1) {
+    const probe = day === 0 ? now : new Date(`${offsetDatePart(toDateInputLocal(now), day)}T00:00:00`);
+    for (const candidate of scheduledActionCandidates(action, groupMap, probe, { includeFuture: true })) {
+      const at = Math.max(now.getTime(), probe.getTime(), Date.parse(candidate.dueAt));
+      if (scheduledActionCandidates(action, groupMap, new Date(at)).some(item => item.runKey === candidate.runKey)) consider(candidate, at);
+    }
+  }
+  return upcoming.sort((left, right) => Date.parse(left.nextRunAt) - Date.parse(right.nextRunAt))[0] || null;
 }
 
 async function readActionSchedulerState() {
@@ -1192,7 +1306,7 @@ function markActionSchedulerState(state, candidate, lastRun, now = new Date()) {
   const sameRun = previous.runKey === candidate.runKey;
   const attempts = (sameRun ? Math.max(0, Number(previous.attempts) || 0) : 0) + 1;
   const status = lastRun?.status || 'unknown';
-  const terminal = status === 'success' || status === 'delivery_uncertain';
+  const terminal = isTerminalScheduledStatus(status);
   const finishedAt = lastRun?.finishedAt || lastRun?.at || now.toISOString();
   const finishedAtMs = Date.parse(finishedAt);
   const nextRetryAt = terminal
@@ -1277,8 +1391,12 @@ function scheduledCandidateState(modeState, runKey, candidate = null) {
   return scheduledCompletedStates(modeState).find(item => item.runKey === legacyRunKey) || null;
 }
 
+function isTerminalScheduledStatus(status) {
+  return ['success', 'delivery_uncertain', 'stopped'].includes(status);
+}
+
 function actionLastRunMatchesCandidate(lastRun, candidate) {
-  if (!lastRun || (lastRun.status !== 'success' && lastRun.status !== 'delivery_uncertain')) return false;
+  if (!lastRun || !isTerminalScheduledStatus(lastRun.status)) return false;
   if (lastRun.runKey === candidate.runKey) return true;
   const legacyHash = scheduledActionConfigHash(candidate.action, candidate.groups || [], candidate.periodMode, { legacy: true });
   return lastRun.runKey === `${candidate.periodMode}:${candidate.from}:${candidate.to}:${legacyHash}`;
@@ -1290,7 +1408,7 @@ function scheduledCompletedStates(modeState) {
     ? modeState.completed.filter(item => item && typeof item === 'object' && item.runKey)
     : [];
   if (
-    (modeState.status === 'success' || modeState.status === 'delivery_uncertain')
+    isTerminalScheduledStatus(modeState.status)
     && modeState.runKey
     && !completed.some(item => item.runKey === modeState.runKey)
   ) {
@@ -1305,7 +1423,7 @@ function scheduledCompletedStates(modeState) {
 
 function shouldRunScheduledCandidate(actionState, candidate, now = new Date()) {
   if (!actionState || actionState.runKey !== candidate.runKey) return true;
-  if (actionState.status === 'success' || actionState.status === 'delivery_uncertain') return false;
+  if (isTerminalScheduledStatus(actionState.status)) return false;
 
   const firstAttemptAtMs = Date.parse(actionState.firstAttemptAt || actionState.at || '');
   if (Number.isFinite(firstAttemptAtMs) && now.getTime() - firstAttemptAtMs > ACTION_SCHEDULER_RETRY_MAX_AGE_MS) {
@@ -1425,7 +1543,7 @@ function uniqueScheduledCandidates(candidates) {
   return [...result.values()];
 }
 
-function scheduledActionCandidates(action, groupMap, now = new Date()) {
+function scheduledActionCandidates(action, groupMap, now = new Date(), options = {}) {
   if (!action || action.periodMode === 'once') return [];
 
   const periodModes = [];
@@ -1433,11 +1551,11 @@ function scheduledActionCandidates(action, groupMap, now = new Date()) {
   if (action.periodMode === 'weekly' || action.reportWeekly) periodModes.push('weekly');
 
   return periodModes
-    .map(periodMode => scheduledActionCandidate(action, groupMap, now, periodMode))
+    .map(periodMode => scheduledActionCandidate(action, groupMap, now, periodMode, options))
     .filter(Boolean);
 }
 
-function scheduledActionCandidate(action, groupMap, now, periodMode = action?.periodMode) {
+function scheduledActionCandidate(action, groupMap, now, periodMode = action?.periodMode, options = {}) {
   if (!action || (periodMode !== 'daily' && periodMode !== 'weekly')) return null;
 
   const groups = (action.groupIds || []).map(groupId => groupMap.get(groupId)).filter(Boolean);
@@ -1459,8 +1577,8 @@ function scheduledActionCandidate(action, groupMap, now, periodMode = action?.pe
     const fridayEveningMs = localDateTimeMs(`${friday}T18:00`);
     const saturdayEndMs = localDateTimeMs(`${offsetDatePart(friday, 1)}T23:59:59`);
     dueAtMs = Math.max(dueAtMs, fridayEveningMs);
-    if (now.getTime() < dueAtMs || now.getTime() > saturdayEndMs) return null;
-  } else if (now.getTime() < dueAtMs) {
+    if ((!options.includeFuture && now.getTime() < dueAtMs) || now.getTime() > saturdayEndMs) return null;
+  } else if (!options.includeFuture && now.getTime() < dueAtMs) {
     return null;
   }
 
@@ -1567,15 +1685,26 @@ function isWeekendDatePart(datePart) {
 }
 
 async function runScheduledOpenAiAction(candidate, context) {
+  const signal = context.signal;
+  const services = context.services || {};
+  const requestApi = services.requestApi || localJsonApi;
   const startedAt = new Date();
   const reportTypes = scheduledReportTypes(candidate);
   let answerData = null;
   let reportData = null;
-  let transcriptResult = null;
+  const transcriptResult = {
+    contextLines: [], warnings: [], issues: [], knownRecordings: 0,
+    completedRecordings: 0, failedSearches: 0, failedRecordings: 0
+  };
   let stage = 'search';
+  const progress = {
+    stage, completedChunks: 0, transcribedSeconds: 0, completedRecordings: 0, knownRecordings: 0,
+    totalSelections: candidate.selections.length, completedSelections: 0,
+    selectionTotalSeconds: 0, selectionProcessedSeconds: 0, percent: 0
+  };
 
   console.log(`OpenAI action scheduler: starting "${candidate.action.name}" for ${candidate.from} - ${candidate.to}`);
-  await updateOpenAiActionLastRun(candidate.action.id, {
+  const runningState = {
     status: 'running',
     scheduled: true,
     at: startedAt.toISOString(),
@@ -1585,14 +1714,25 @@ async function runScheduledOpenAiAction(candidate, context) {
     dueAt: candidate.dueAt,
     runKey: candidate.runKey,
     stage: 'search'
-  }).catch(error => {
-    console.warn(`OpenAI action scheduler could not save running status: ${publicError(error)}`);
-  });
-
+  };
+  const onProgress = async update => {
+    signal?.throwIfAborted();
+    Object.assign(progress, update);
+    stage = progress.stage;
+    progress.percent = Math.max(progress.percent, scheduledProgressPercent(progress));
+    if (context.runtime) context.runtime.lastRun = { ...runningState, stage, progress: { ...progress } };
+    await (services.updateLastRun || updateOpenAiActionLastRun)(candidate.action.id, {
+      ...runningState, stage, progress: { ...progress }
+    }).catch(error => {
+      console.warn(`OpenAI action scheduler could not save running status: ${publicError(error)}`);
+    });
+  };
   try {
-    transcriptResult = await buildScheduledActionTranscript(candidate, context);
-    stage = 'ask';
-    answerData = await localJsonApi('/api/openai/ask', {
+    await onProgress({ stage: 'search' });
+    await buildScheduledActionTranscript(candidate, { ...context, requestApi, result: transcriptResult, progress, onProgress });
+    await onProgress({ stage: 'ask' });
+    answerData = await requestApi('/api/openai/ask', {
+      signal,
       method: 'POST',
       body: {
         question: candidate.action.question,
@@ -1622,8 +1762,9 @@ async function runScheduledOpenAiAction(candidate, context) {
     });
 
     if (reportTypes.length) {
-      stage = 'report';
-      reportData = await localJsonApi('/api/reports/send', {
+      await onProgress({ stage: 'report' });
+      // An accepted SMTP message cannot be recalled; stop waits for its receipt.
+      reportData = await requestApi('/api/reports/send', {
         method: 'POST',
         body: {
           reportTypes,
@@ -1664,6 +1805,7 @@ async function runScheduledOpenAiAction(candidate, context) {
       });
     }
 
+    signal?.throwIfAborted();
     const lastRun = {
       status: 'success',
       scheduled: true,
@@ -1680,10 +1822,21 @@ async function runScheduledOpenAiAction(candidate, context) {
       selections: candidate.selections.length,
       recordings: transcriptResult.knownRecordings,
       reports: reportData?.sent || [],
+      progress: { ...progress, stage: 'done', percent: 100 },
+      warnings: transcriptResult.warnings,
       runKey: candidate.runKey
     };
+    if (transcriptResult.issues.length) {
+      lastRun.errorNotification = await (services.notifyError || sendScheduledActionErrorEmail)(candidate, {
+        ...lastRun,
+        error: 'Часть записей не обработана. Ответ сформирован по доступному тексту.',
+        stage: 'transcript',
+        details: { issues: transcriptResult.issues }
+      });
+    }
+    signal?.throwIfAborted();
     try {
-      await persistScheduledActionRun(candidate, lastRun, {
+      await (services.persistRun || persistScheduledActionRun)(candidate, lastRun, {
         reportTypes,
         warnings: transcriptResult.warnings
       });
@@ -1699,15 +1852,19 @@ async function runScheduledOpenAiAction(candidate, context) {
       stage,
       answerData,
       transcriptResult,
-      reportData
+      reportData,
+      progress,
+      signal,
+      services
     });
   }
 }
 
 async function persistScheduledActionFailure(candidate, error, context = {}) {
+  const stopped = Boolean(context.signal?.aborted);
   const deliveryUncertain = Boolean(error?.deliveryUncertain || error?.details?.deliveryUncertain);
   const lastRun = {
-    status: deliveryUncertain ? 'delivery_uncertain' : 'error',
+    status: stopped ? 'stopped' : deliveryUncertain ? 'delivery_uncertain' : 'error',
     scheduled: true,
     at: new Date().toISOString(),
     startedAt: context.startedAt?.toISOString?.() || new Date().toISOString(),
@@ -1715,8 +1872,8 @@ async function persistScheduledActionFailure(candidate, error, context = {}) {
     from: candidate.from,
     to: candidate.to,
     dueAt: candidate.dueAt,
-    error: publicError(error),
-    stage: context.stage || 'scheduler',
+    error: stopped ? '' : publicError(error),
+    stage: error?.details?.stage || context.stage || 'scheduler',
     model: context.answerData?.model || '',
     responseId: context.answerData?.responseId || '',
     answer: context.answerData?.answer || '',
@@ -1725,15 +1882,32 @@ async function persistScheduledActionFailure(candidate, error, context = {}) {
     recordings: context.transcriptResult?.knownRecordings || 0,
     reports: context.reportData?.sent || [],
     runKey: candidate.runKey,
-    details: error.details
+    details: error.details,
+    progress: context.progress ? { ...context.progress } : undefined,
+    warnings: context.transcriptResult?.warnings || []
   };
-  await persistScheduledActionRun(candidate, lastRun, {
+  if (!stopped) lastRun.errorNotification = await (context.services?.notifyError || sendScheduledActionErrorEmail)(candidate, lastRun);
+  if (context.signal?.aborted) {
+    lastRun.status = 'stopped';
+    lastRun.error = '';
+  }
+  await (context.services?.persistRun || persistScheduledActionRun)(candidate, lastRun, {
     errorDetails: error.details
   }).catch(persistError => {
     console.warn(`OpenAI action scheduler could not save failed run: ${publicError(persistError)}`);
   });
   console.warn(`OpenAI action scheduler: "${candidate.action.name}" failed at ${lastRun.stage}: ${lastRun.error}`);
   return lastRun;
+}
+
+function scheduledProgressPercent(progress) {
+  if (progress.stage === 'done') return 100;
+  if (progress.stage === 'report') return 97;
+  if (progress.stage === 'ask') return 90;
+  const fraction = progress.selectionTotalSeconds > 0
+    ? Math.min(1, (progress.selectionProcessedSeconds || 0) / progress.selectionTotalSeconds)
+    : 0;
+  return Math.round(900 * Math.min(1, ((progress.completedSelections || 0) + fraction) / Math.max(1, progress.totalSelections || 1))) / 10;
 }
 
 async function persistScheduledActionRun(candidate, lastRun, extraDetails = {}) {
@@ -1771,15 +1945,25 @@ async function persistScheduledActionRun(candidate, lastRun, extraDetails = {}) 
 }
 
 async function buildScheduledActionTranscript(candidate, context) {
-  const contextLines = [];
-  const warnings = [];
-  let knownRecordings = 0;
-  let completedRecordings = 0;
-  let failedSearches = 0;
-  let failedRecordings = 0;
+  const result = context.result || {
+    contextLines: [], warnings: [], issues: [], knownRecordings: 0,
+    completedRecordings: 0, failedSearches: 0, failedRecordings: 0
+  };
+  const { contextLines, warnings, issues } = result;
+  const requestApi = context.requestApi || localJsonApi;
+  const progress = context.progress || {};
+  const finishSelection = () => context.onProgress?.({
+    completedSelections: (progress.completedSelections || 0) + 1,
+    selectionProcessedSeconds: 0, selectionTotalSeconds: 0
+  });
 
   for (const selection of candidate.selections) {
+    context.signal?.throwIfAborted();
     const label = `${selection.groupName} · ${channelLabelFromRows(context.labels, selection.channel)}`;
+    await context.onProgress?.({
+      stage: 'search', channel: selection.channel, label,
+      from: selection.from, to: selection.to, fileName: '', selectionProcessedSeconds: 0, selectionTotalSeconds: 0
+    });
     const query = new URLSearchParams(scheduledCameraParams(context.settings, selection.channel));
     query.set('from', selection.from);
     query.set('to', selection.to);
@@ -1788,10 +1972,16 @@ async function buildScheduledActionTranscript(candidate, context) {
     const searchPath = `/api/recordings/search?${query}`;
     let searchData;
     try {
-      searchData = await localJsonApi(searchPath);
+      searchData = await requestApi(searchPath, { signal: context.signal });
     } catch (error) {
-      failedSearches += 1;
+      context.signal?.throwIfAborted();
+      result.failedSearches += 1;
       warnings.push(`${label}: поиск записей: ${publicError(error)}`);
+      if (issues.length < 100) issues.push({
+        stage: 'search', label, channel: selection.channel, from: selection.from, to: selection.to,
+        error: publicError(error), status: error.statusCode, details: error.details
+      });
+      await finishSelection();
       continue;
     }
     if (searchData.warning) warnings.push(`${label}: ${searchData.warning}`);
@@ -1800,13 +1990,20 @@ async function buildScheduledActionTranscript(candidate, context) {
       .map(item => ({ item, coverage: recordingCoverageForRange(item, selection.from, selection.to) }))
       .filter(entry => entry.coverage && entry.coverage.durationSeconds > 0);
 
-    knownRecordings += items.length;
+    result.knownRecordings += items.length;
+    await context.onProgress?.({
+      knownRecordings: result.knownRecordings,
+      selectionTotalSeconds: items.reduce((sum, entry) => sum + entry.coverage.durationSeconds, 0)
+    });
     if (!items.length) {
       warnings.push(`${label}: записи не найдены`);
+      await finishSelection();
       continue;
     }
 
     for (const entry of items) {
+      context.signal?.throwIfAborted();
+      const processedBefore = progress.selectionProcessedSeconds || 0;
       try {
         await transcribeScheduledRecording({
           item: entry.item,
@@ -1815,37 +2012,45 @@ async function buildScheduledActionTranscript(candidate, context) {
           settings: context.settings,
           labels: context.labels,
           vendor: searchData.vendor || '',
-          contextLines
+          contextLines,
+          requestApi,
+          progress,
+          signal: context.signal,
+          onProgress: context.onProgress
         });
-        completedRecordings += 1;
+        result.completedRecordings += 1;
+        await context.onProgress?.({ completedRecordings: result.completedRecordings });
       } catch (error) {
-        failedRecordings += 1;
+        context.signal?.throwIfAborted();
+        result.failedRecordings += 1;
         const recording = entry.item.fileName || entry.item.startTime || 'архивный фрагмент';
         warnings.push(`${label}: ${recording}: ${publicError(error)}`);
+        if (issues.length < 100) issues.push({
+          stage: 'transcript', label, channel: selection.channel,
+          fileName: recording, error: publicError(error), status: error.statusCode,
+          ...error.details
+        });
       }
+      await context.onProgress?.({ selectionProcessedSeconds: processedBefore + entry.coverage.durationSeconds });
     }
+    await finishSelection();
   }
 
-  if (!completedRecordings && !contextLines.length && (failedSearches || failedRecordings)) {
+  if (!result.completedRecordings && !contextLines.length && (result.failedSearches || result.failedRecordings)) {
     throw httpError(
       502,
-      `Не удалось получить пригодный транскрипт: ошибок поиска ${failedSearches}, ошибок записей ${failedRecordings}.`,
+      `Не удалось получить пригодный транскрипт: ошибок поиска ${result.failedSearches}, ошибок записей ${result.failedRecordings}.`,
       {
-        failedSearches,
-        failedRecordings,
+        stage: result.failedRecordings ? 'transcript' : 'search',
+        failedSearches: result.failedSearches,
+        failedRecordings: result.failedRecordings,
+        issues,
         warnings: warnings.slice(-100)
       }
     );
   }
 
-  return {
-    contextLines,
-    warnings,
-    knownRecordings,
-    completedRecordings,
-    failedSearches,
-    failedRecordings
-  };
+  return result;
 }
 
 async function transcribeScheduledRecording(options) {
@@ -1854,6 +2059,7 @@ async function transcribeScheduledRecording(options) {
   const chunkSeconds = scheduledTranscriptSeconds(options.settings);
 
   while (offsetSeconds < endOffsetSeconds - 0.05) {
+    options.signal?.throwIfAborted();
     const remainingSeconds = Math.max(0, endOffsetSeconds - offsetSeconds);
     const durationSeconds = Math.min(chunkSeconds, remainingSeconds);
     const query = scheduledRecordingQuery(
@@ -1867,7 +2073,20 @@ async function transcribeScheduledRecording(options) {
     query.set('offsetSeconds', String(offsetSeconds));
     query.set('_', Date.now());
 
-    const data = await localJsonApi(`/api/recordings/transcript?${query}`);
+    const chunk = {
+      stage: 'transcript', channel: options.selection.channel,
+      fileName: options.item.fileName || '', offsetSeconds, durationSeconds,
+      from: addSecondsToLocalDateTime(options.item.startTime || options.coverage.from, offsetSeconds),
+      to: addSecondsToLocalDateTime(options.item.startTime || options.coverage.from, offsetSeconds + durationSeconds)
+    };
+    await options.onProgress?.(chunk);
+    let data;
+    try {
+      data = await (options.requestApi || localJsonApi)(`/api/recordings/transcript?${query}`, { signal: options.signal });
+      options.signal?.throwIfAborted();
+    } catch (error) {
+      throw httpError(error.statusCode || 502, publicError(error), { ...chunk, cause: error.details });
+    }
     appendScheduledOpenAiContext({
       contextLines: options.contextLines,
       labels: options.labels,
@@ -1879,6 +2098,12 @@ async function transcribeScheduledRecording(options) {
 
     const consumedSeconds = Math.max(0.5, Math.min(data.durationSeconds || durationSeconds, remainingSeconds));
     offsetSeconds += consumedSeconds;
+    const progress = options.progress || {};
+    await options.onProgress?.({
+      completedChunks: (progress.completedChunks || 0) + 1,
+      transcribedSeconds: (progress.transcribedSeconds || 0) + consumedSeconds,
+      selectionProcessedSeconds: (progress.selectionProcessedSeconds || 0) + consumedSeconds
+    });
   }
 }
 
@@ -1909,7 +2134,11 @@ function scheduledRecordingQuery(item, channel, fallback, settings, vendorOverri
 }
 
 function scheduledTranscriptSeconds(settings) {
-  return clampNumber(Number(settings?.transcriptSeconds || cameraConfig().transcriptionLiveSeconds || 18), 5, 60);
+  const config = cameraConfig();
+  return Math.min(
+    clampNumber(Number(settings?.transcriptSeconds || config.transcriptionLiveSeconds || 18), 5, 60),
+    archiveCaptureChunkSeconds(config)
+  );
 }
 
 function scheduledReportTypes(candidate) {
@@ -1996,7 +2225,8 @@ async function localJsonApi(pathname, options = {}) {
   };
   const request = {
     method: options.method || 'GET',
-    headers
+    headers,
+    signal: options.signal
   };
 
   if (options.body !== undefined) {
@@ -2981,7 +3211,8 @@ async function transcribeAudio(req, res, config, params, mode) {
 
     const result = await transcribeWithGigaAm(config, audioPath, {
       chunkSeconds: config.transcriptionChunkSeconds,
-      offsetSeconds
+      offsetSeconds,
+      signal
     });
 
     if (signal.aborted) return;
@@ -3103,15 +3334,81 @@ async function sendReportEmail(req, res) {
 }
 
 async function readReportRecipients() {
-  const fromEnv = normalizeEmailList(process.env.REPORT_EMAIL_TO || process.env.REPORT_RECIPIENTS || '');
-  if (fromEnv.length) return fromEnv;
-
   try {
     const settings = await readAppSetting('ui_settings');
-    return normalizeEmailList(settings?.reportEmails || '');
-  } catch {
-    return [];
+    const recipients = normalizeEmailList(settings?.reportEmails || '');
+    if (recipients.length) return recipients;
+  } catch {}
+  return normalizeEmailList(process.env.REPORT_EMAIL_TO || process.env.REPORT_RECIPIENTS || '');
+}
+
+async function sendScheduledActionErrorEmail(candidate, run, services = {}) {
+  try {
+    const config = services.config || emailConfig();
+    const recipients = normalizeEmailList(await (services.readRecipients || readReportRecipients)());
+    if (!recipients.length) return { status: 'skipped', reason: 'Почты для отчётов не указаны.' };
+    if (!config.host || !isEmailAddress(extractEmailAddress(config.from))) {
+      throw new Error('SMTP не настроен для отправки уведомления об ошибке.');
+    }
+    const message = scheduledActionErrorMessage(candidate, run, recipients);
+    const sent = await (services.sendMail || sendSmtpMail)(config, message);
+    return {
+      status: 'sent', at: new Date().toISOString(), recipients: recipients.length,
+      messageId: sent.messageId, smtpResponse: sent.smtpResponse
+    };
+  } catch (error) {
+    const message = redactDiagnosticText(publicError(error));
+    console.warn(`Background action error notification failed: ${message}`);
+    return {
+      status: error.deliveryUncertain ? 'delivery_uncertain' : 'error',
+      at: new Date().toISOString(), error: message,
+      details: error.details ? redactDiagnosticText(JSON.stringify(error.details)) : undefined
+    };
   }
+}
+
+function scheduledActionErrorMessage(candidate, run, recipients) {
+  const stageLabels = {
+    search: 'Поиск записей', transcript: 'Подготовка аудио и транскрибация',
+    ask: 'Запрос к OpenAI', report: 'Отправка отчёта', scheduler: 'Планировщик'
+  };
+  const progress = run.progress || {};
+  const lines = [
+    run.status === 'success' ? 'Фоновое действие выполнено с пропусками' : 'Ошибка фонового действия',
+    `Действие: ${candidate.action.name}`,
+    `Период: ${formatReportDateTime(candidate.from)} - ${formatReportDateTime(candidate.to)}`,
+    `Часовой пояс: ${process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    `Этап: ${stageLabels[run.stage] || run.stage || 'Выполнение'}`,
+    `Время ошибки: ${formatReportDateTime(run.finishedAt || run.at)}`,
+    `Вопрос: ${candidate.action.question || ''}`,
+    `Ошибка: ${run.error || ''}`,
+    `Готово частей: ${progress.completedChunks || 0}; аудио: ${progress.transcribedSeconds || 0} сек.; записей: ${progress.completedRecordings || 0}/${progress.knownRecordings || 0}`,
+    progress.label ? `Камера/группа: ${progress.label}` : '',
+    progress.fileName ? `Запись: ${progress.fileName}` : '',
+    progress.from ? `Фрагмент: ${formatReportDateTime(progress.from)} - ${formatReportDateTime(progress.to)}` : '',
+    '',
+    'Выбранные камеры:',
+    ...(candidate.selections || []).map(selection =>
+      `${selection.groupName || 'Группа'}: камера ${selection.channel}, ${formatReportDateTime(selection.from)} - ${formatReportDateTime(selection.to)}`),
+    ...(run.warnings?.length ? ['', 'Предупреждения:', ...run.warnings] : []),
+    ...(run.details ? ['', 'Технические детали:', JSON.stringify(run.details, null, 2)] : [])
+  ];
+  const text = redactDiagnosticText(lines.join('\n')).slice(0, 64000);
+  return {
+    to: recipients,
+    subject: redactDiagnosticText(`Ошибка фонового действия: ${candidate.action.name}`),
+    text,
+    html: `<pre style="font-family:Arial,sans-serif;white-space:pre-wrap">${escapeHtmlText(text)}</pre>`
+  };
+}
+
+function redactDiagnosticText(value) {
+  let text = String(value || '');
+  for (const [key, secret] of Object.entries(process.env)) {
+    if (!/(?:PASSWORD|PASS|API_KEY|TOKEN|SECRET)$/.test(key) || !secret) continue;
+    text = text.replaceAll(secret, '***').replaceAll(encodeURIComponent(secret), '***');
+  }
+  return text.replace(/(\w+:\/\/)[^\s/@]+:[^\s/@]+@/g, '$1***@');
 }
 
 function normalizeReportTypes(payload) {
@@ -3712,18 +4009,146 @@ function openAiConfig() {
   return {
     apiKey: process.env.OPENAI_API_KEY || '',
     model: process.env.OPENAI_MODEL || 'gpt-5.6-terra',
+    proxyUrl: String(process.env.OPENAI_PROXY_URL || '').trim(),
     timeoutMs: numberFromEnv('OPENAI_TIMEOUT_MS', 120000),
     maxOutputTokens: numberFromEnv('OPENAI_MAX_OUTPUT_TOKENS', 1200)
   };
 }
 
+function createOpenAiProxyAgent(value) {
+  const proxyUrl = resolveOpenAiProxyUrl(value);
+  if (!proxyUrl) return undefined;
+
+  try {
+    const url = new URL(proxyUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || url.pathname !== '/' || url.search || url.hash) {
+      throw new Error('Invalid proxy URL');
+    }
+    return new ProxyAgent({ uri: url.href, proxyTunnel: true });
+  } catch {
+    throw httpError(500, `Invalid OPENAI_PROXY_URL. Use an HTTP(S) proxy URL or ${VPNXXX_AUTO_PROXY_URL}.`);
+  }
+}
+
+function resolveOpenAiProxyUrl(value, env = process.env) {
+  const proxyUrl = String(value || '').trim();
+  if (proxyUrl !== VPNXXX_AUTO_PROXY_URL) return proxyUrl;
+
+  const appData = String(env.APPDATA || '').trim()
+    || (String(env.USERPROFILE || '').trim() ? path.join(String(env.USERPROFILE).trim(), 'AppData', 'Roaming') : '');
+  if (!appData) {
+    throw vpnxxxProxyError('APPDATA is unavailable', 'VPNXXX_APPDATA_UNAVAILABLE');
+  }
+
+  let configText;
+  try {
+    configText = readBoundedUtf8File(
+      path.join(appData, 'vpnxxx', 'temp', 'privoxy.conf'),
+      VPNXXX_PRIVOXY_CONFIG_MAX_BYTES
+    );
+  } catch (error) {
+    if (error?.code === 'VPNXXX_CONFIG_TOO_LARGE') {
+      throw vpnxxxProxyError('privoxy.conf is too large to read safely', error.code);
+    }
+    throw vpnxxxProxyError('privoxy.conf is unavailable; start or restart vpnxxx', 'VPNXXX_CONFIG_UNAVAILABLE');
+  }
+
+  const listeners = parseVpnxxxPrivoxyListeners(configText);
+  if (listeners.length === 0) {
+    throw vpnxxxProxyError('privoxy.conf has no valid loopback listen-address', 'VPNXXX_LISTENER_NOT_FOUND');
+  }
+  const ports = new Set(listeners.map(listener => new URL(listener).port));
+  if (ports.size > 1) {
+    throw vpnxxxProxyError('privoxy.conf has loopback listen-address entries with different ports', 'VPNXXX_LISTENER_AMBIGUOUS');
+  }
+  return listeners.find(listener => listener.startsWith('http://127.0.0.1:'))
+    || listeners.find(listener => listener.startsWith('http://127.'))
+    || listeners[0];
+}
+
+function readBoundedUtf8File(filePath, maxBytes) {
+  const handle = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let totalBytesRead = 0;
+    while (totalBytesRead < buffer.length) {
+      const bytesRead = fs.readSync(handle, buffer, totalBytesRead, buffer.length - totalBytesRead, null);
+      if (bytesRead === 0) break;
+      totalBytesRead += bytesRead;
+    }
+    if (totalBytesRead > maxBytes) {
+      const error = new Error('File exceeds configured read limit.');
+      error.code = 'VPNXXX_CONFIG_TOO_LARGE';
+      throw error;
+    }
+    return buffer.subarray(0, totalBytesRead).toString('utf8');
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function parseVpnxxxPrivoxyListeners(configText) {
+  const listeners = new Set();
+  for (const rawLine of String(configText || '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, '').trim();
+    if (!line) continue;
+    const match = /^listen-address\s+(\S+)\s*$/i.exec(line);
+    if (!match) continue;
+    const proxyUrl = loopbackProxyUrl(match[1]);
+    if (proxyUrl) listeners.add(proxyUrl);
+  }
+  return [...listeners];
+}
+
+function loopbackProxyUrl(endpoint) {
+  let host;
+  let portText;
+  const bracketedIpv6 = /^\[([^\]]+)\]:(\d+)$/.exec(endpoint);
+  if (bracketedIpv6) {
+    [, host, portText] = bracketedIpv6;
+  } else {
+    const hostAndPort = /^([^:\s]+):(\d+)$/.exec(endpoint);
+    if (!hostAndPort) return '';
+    [, host, portText] = hostAndPort;
+  }
+
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return '';
+
+  const normalizedHost = host.toLowerCase();
+  if (normalizedHost === 'localhost') return `http://127.0.0.1:${port}`;
+  if (net.isIP(normalizedHost) === 4 && Number(normalizedHost.split('.')[0]) === 127) {
+    return `http://${normalizedHost}:${port}`;
+  }
+  if (net.isIP(normalizedHost) === 6 && normalizedHost === '::1') {
+    return `http://[::1]:${port}`;
+  }
+  return '';
+}
+
+function vpnxxxProxyError(reason, code) {
+  return httpError(502, `OpenAI proxy auto-detection failed: ${reason}.`, {
+    transport: 'proxy',
+    proxy: 'vpnxxx',
+    code
+  });
+}
+
 async function createOpenAiResponse(config, payload, signal) {
   const timeout = new AbortController();
   const abort = () => timeout.abort();
-  const timer = setTimeout(abort, config.timeoutMs);
+  let timedOut = false;
+  let dispatcher;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort();
+  }, config.timeoutMs);
   signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
 
   try {
+    timeout.signal.throwIfAborted();
+    dispatcher = createOpenAiProxyAgent(config.proxyUrl);
     const response = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
@@ -3742,7 +4167,8 @@ async function createOpenAiResponse(config, payload, signal) {
         ].join(' '),
         input: openAiInput(payload)
       }),
-      signal: timeout.signal
+      signal: timeout.signal,
+      ...(dispatcher ? { dispatcher } : {})
     });
     const text = await response.text();
     const data = safeJsonParse(text);
@@ -3761,13 +4187,26 @@ async function createOpenAiResponse(config, payload, signal) {
 
     return data;
   } catch (error) {
-    if (signal?.aborted || error.name === 'AbortError') {
+    if (signal?.aborted) {
       throw httpError(499, 'OpenAI request was cancelled.');
     }
-    throw error;
+    if (timedOut) {
+      throw httpError(504, `OpenAI request timed out after ${config.timeoutMs} ms.`, {
+        transport: dispatcher ? 'proxy' : 'direct', timeoutMs: config.timeoutMs
+      });
+    }
+    if (error.statusCode) throw error;
+    const cause = redactDiagnosticText(error.cause?.message || error.message);
+    throw httpError(502, dispatcher
+      ? `OpenAI proxy connection failed. Проверьте, что VPN/прокси включён и доступен. ${cause}`
+      : `OpenAI connection failed. ${cause}`, {
+      transport: dispatcher ? 'proxy' : 'direct',
+      code: error.cause?.code || error.code || ''
+    });
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
+    await dispatcher?.destroy();
   }
 }
 
@@ -4236,6 +4675,9 @@ function captureRtspWav(config, options, outputPath, capture) {
 }
 
 async function captureXmArchiveWav(config, params, channel, stream, outputPath, capture) {
+  if (!(capture.durationSeconds > 0) || capture.durationSeconds > archiveCaptureChunkSeconds(config)) {
+    throw httpError(400, 'Archive audio must be captured in bounded chunks.');
+  }
   const fileName = params.get('fileName') || '';
   const baseLocalBeginTime = params.get('localBeginTime') || toXmLocalTime(params.get('from') || new Date().toISOString());
   const localBeginTime = addSecondsToLocalDateTime(baseLocalBeginTime, capture.offsetSeconds || 0, ' ');
@@ -4266,9 +4708,7 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
     'pipe:0'
   ];
   addAudioFilterArgs(ffmpegArgs, capture.audioFilter);
-  if (capture.durationSeconds > 0) {
-    ffmpegArgs.push('-t', formatDuration(capture.durationSeconds));
-  }
+  // The G.711 input is bounded below, so ffmpeg can drain it without an early pipe close.
   ffmpegArgs.push(
     '-ac',
     '1',
@@ -4286,13 +4726,6 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
       stdio: ['pipe', 'ignore', 'pipe'],
       windowsHide: true
     });
-    const audioDemuxer = createXmG711Demuxer(chunk => {
-      safeStreamWrite(ffmpeg.stdin, chunk, error => {
-        handleStreamError(error, 'xm transcription ffmpeg stdin failed', config);
-        finish(error);
-      });
-    });
-
     let wsHandle;
     let closed = false;
     let commandStarted = false;
@@ -4317,9 +4750,10 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
     const cleanup = async () => {
       if (closed) return;
       closed = true;
+      capture.signal?.removeEventListener('abort', abort);
 
       try {
-        wsHandle?.close();
+        wsHandle?.destroy();
       } catch {}
 
       if (ffmpeg.exitCode === null && !ffmpeg.killed) {
@@ -4342,23 +4776,40 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
       });
     };
 
-    ffmpeg.stdin.on('error', error => handleStreamError(error, 'xm transcription ffmpeg stdin failed', config));
+    const input = createXmAudioChunkWriter(ffmpeg.stdin, capture.durationSeconds, {
+      pause: () => wsHandle?.pause(),
+      resume: () => wsHandle?.resume(),
+      stop: () => wsHandle?.destroy(),
+      onError: error => finish(httpError(502, `Archive audio pipe failed: ${publicError(error)}`, {
+        channel, localBeginTime, localEndTime, fileName,
+        receivedAudioBytes: input.bytesWritten
+      }))
+    });
+    const audioDemuxer = createXmG711Demuxer(chunk => input.write(chunk));
     ffmpeg.stderr.on('error', error => handleStreamError(error, 'xm transcription ffmpeg stderr failed', config));
     ffmpeg.stderr.on('data', chunk => {
       stderr = (stderr + chunk.toString('utf8')).slice(-4000);
     });
     ffmpeg.on('error', error => finish(error));
-    ffmpeg.on('close', code => {
-      if (code !== 0 && code !== null) {
-        finish(httpError(502, `ffmpeg failed while preparing archive audio. ${redactSecrets(stderr, config)}`.trim()));
+    ffmpeg.on('close', (code, signal) => {
+      if (code !== 0) {
+        finish(httpError(502, `ffmpeg failed while preparing archive audio. ${redactSecrets(stderr, config)}`.trim(), {
+          channel, localBeginTime, localEndTime, fileName, exitCode: code, signal,
+          durationSeconds: capture.durationSeconds, receivedAudioBytes: input.bytesWritten
+        }));
         return;
       }
       finish();
     });
 
-    capture.signal?.addEventListener('abort', () => {
+    const abort = () => {
       finish(httpError(499, 'Transcription request was cancelled.'));
-    }, { once: true });
+    };
+    if (capture.signal?.aborted) {
+      abort();
+      return;
+    }
+    capture.signal?.addEventListener('abort', abort, { once: true });
 
     const playbackOptions = {
       Name: 'HttpPlayBack',
@@ -4386,6 +4837,7 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
 
     openXmWebSocket(config, wsPath, {
       onText: async text => {
+        if (settled) return;
         const message = safeJsonParse(text);
         if (message?.Ret === 100 && message.State === 'Begin' && !commandStarted) {
           commandStarted = true;
@@ -4425,15 +4877,13 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
         }
       },
       onBinary: buffer => {
-        if (buffer.length > 0) {
+        if (!settled && !input.ended && buffer.length > 0) {
           audioDemuxer.push(buffer);
         }
       },
       onClose: () => {
         audioDemuxer.flush();
-        if (ffmpeg.stdin.writable) {
-          ffmpeg.stdin.end();
-        }
+        input.end();
       },
       onError: error => {
         finish(error);
@@ -4441,11 +4891,55 @@ async function captureXmArchiveWav(config, params, channel, stream, outputPath, 
     })
       .then(handle => {
         wsHandle = handle;
+        if (settled || input.ended) handle.destroy();
+        else if (input.backpressured) handle.pause();
       })
       .catch(error => {
         finish(error);
       });
   });
+}
+
+function createXmAudioChunkWriter(input, durationSeconds, handlers = {}) {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    throw httpError(400, 'Audio chunk duration must be finite and positive.');
+  }
+  // Mono G.711 at 8 kHz carries exactly 8,000 bytes per second.
+  const byteLimit = Math.ceil(durationSeconds * 8000);
+  let bytesWritten = 0;
+  let ended = false;
+  let backpressured = false;
+  const end = () => {
+    if (ended) return;
+    ended = true;
+    if (!input.destroyed && !input.writableEnded) input.end();
+    handlers.stop?.();
+  };
+  input.on('error', error => {
+    ended = true;
+    handlers.stop?.();
+    handlers.onError?.(error);
+  });
+  input.on('drain', () => {
+    backpressured = false;
+    if (!ended) handlers.resume?.();
+  });
+  return {
+    get bytesWritten() { return bytesWritten; },
+    get ended() { return ended; },
+    get backpressured() { return backpressured; },
+    end,
+    write(chunk) {
+      if (ended || !chunk.length) return;
+      const data = chunk.subarray(0, byteLimit - bytesWritten);
+      bytesWritten += data.length;
+      if (!input.write(data)) {
+        backpressured = true;
+        handlers.pause?.();
+      }
+      if (bytesWritten >= byteLimit) end();
+    }
+  };
 }
 
 async function streamRecordingFile(req, res, config, params) {
@@ -5004,6 +5498,7 @@ function openXmWebSocket(config, wsPath, handlers) {
       if (head?.length) parser.push(head);
 
       resolve({
+        destroy: () => socket.destroy(),
         close: () => {
           if (!socket.destroyed) {
             sendWebSocketFrame(socket, 0x8, Buffer.alloc(0));
@@ -5417,12 +5912,24 @@ function audioFilterGraph(preset) {
 }
 
 function transcribeWithGigaAm(config, audioPath, options = {}) {
-  const worker = getGigaAmWorker(config);
-  return worker.request({
-    audioPath,
-    chunkSeconds: options.chunkSeconds || config.transcriptionChunkSeconds,
-    offsetSeconds: options.offsetSeconds || 0
-  }, config.transcriptionTimeoutMs);
+  // Serialize access so cancelling a block never kills another request's worker.
+  const operation = gigaAmTranscriptionQueue.then(async () => {
+    options.signal?.throwIfAborted();
+    const worker = getGigaAmWorker(config);
+    const abort = () => worker.stop();
+    options.signal?.addEventListener('abort', abort, { once: true });
+    try {
+      return await worker.request({
+        audioPath,
+        chunkSeconds: options.chunkSeconds || config.transcriptionChunkSeconds,
+        offsetSeconds: options.offsetSeconds || 0
+      }, config.transcriptionTimeoutMs);
+    } finally {
+      options.signal?.removeEventListener('abort', abort);
+    }
+  });
+  gigaAmTranscriptionQueue = operation.catch(() => {});
+  return operation;
 }
 
 function getGigaAmWorker(config) {
@@ -5497,6 +6004,7 @@ function createGigaAmWorker(config, key) {
     },
     stop() {
       state.closed = true;
+      state.readyReject?.(httpError(499, 'Transcription was cancelled.'));
       rejectPendingWorkerRequests(state, httpError(503, 'GigaAM worker was stopped.'));
       if (!child.killed) child.kill('SIGTERM');
     }
@@ -5677,7 +6185,14 @@ function transcriptionDurationSeconds(params, config, mode) {
   if (config.transcriptionArchiveMaxSeconds > 0 && (!seconds || seconds > config.transcriptionArchiveMaxSeconds)) {
     seconds = config.transcriptionArchiveMaxSeconds;
   }
-  return seconds > 0 ? seconds : 0;
+  // Every API request returns one bounded block; callers advance by durationSeconds.
+  const chunkSeconds = archiveCaptureChunkSeconds(config);
+  return seconds > 0 ? Math.min(seconds, chunkSeconds) : chunkSeconds;
+}
+
+function archiveCaptureChunkSeconds(config) {
+  const value = Number(config.transcriptionCaptureChunkSeconds);
+  return Number.isFinite(value) && value > 0 ? clampNumber(value, 5, 60) : 30;
 }
 
 function transcriptCacheKey(config, params, values) {
@@ -6323,8 +6838,19 @@ export {
   transcriptionPreparationPending,
   transcriptionRuntimeStatus,
   checkTranscriber,
+  createOpenAiResponse,
+  resolveOpenAiProxyUrl,
+  runScheduledOpenAiAction,
+  stopScheduledOpenAiAction,
+  assertScheduledActionsEditable,
+  forceScheduledCandidateRetry,
+  nextScheduledActionRun,
+  scheduledProgressPercent,
+  localJsonApi,
   actionLastRunMatchesCandidate,
+  buildScheduledActionTranscript,
   buildReportDocxAttachment,
+  createXmAudioChunkWriter,
   isWeekendDatePart,
   markActionSchedulerState,
   normalizeStoredAction,
@@ -6334,7 +6860,11 @@ export {
   scheduledActionConfigHash,
   scheduledActionCandidates,
   scheduledReportTypes,
+  scheduledActionErrorMessage,
+  sendScheduledActionErrorEmail,
   scheduledRetryCandidates,
   scheduledRetryDelayMs,
-  shouldRunScheduledCandidate
+  shouldRunScheduledCandidate,
+  transcribeScheduledRecording,
+  transcriptionDurationSeconds
 };
