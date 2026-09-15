@@ -19,6 +19,8 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const RUNTIME_DIR = path.join(__dirname, '.runtime');
 const TRANSCRIPT_DIR = path.join(process.env.TEMP || process.env.TMP || RUNTIME_DIR, 'camera-audio-listener-transcripts');
 const GIGAAM_WORKER_SCRIPT = path.join(__dirname, 'scripts', 'gigaam_worker.py');
+const VPNXXX_AUTO_PROXY_URL = 'vpnxxx://auto';
+const VPNXXX_PRIVOXY_CONFIG_MAX_BYTES = 64 * 1024;
 
 loadDotEnv(path.join(__dirname, '.env'));
 
@@ -3958,7 +3960,7 @@ function openAiConfig() {
 }
 
 function createOpenAiProxyAgent(value) {
-  const proxyUrl = String(value || '').trim();
+  const proxyUrl = resolveOpenAiProxyUrl(value);
   if (!proxyUrl) return undefined;
 
   try {
@@ -3968,8 +3970,112 @@ function createOpenAiProxyAgent(value) {
     }
     return new ProxyAgent({ uri: url.href, proxyTunnel: true });
   } catch {
-    throw httpError(500, 'Invalid OPENAI_PROXY_URL. Use an HTTP(S) proxy URL, for example http://127.0.0.1:1080.');
+    throw httpError(500, `Invalid OPENAI_PROXY_URL. Use an HTTP(S) proxy URL or ${VPNXXX_AUTO_PROXY_URL}.`);
   }
+}
+
+function resolveOpenAiProxyUrl(value, env = process.env) {
+  const proxyUrl = String(value || '').trim();
+  if (proxyUrl !== VPNXXX_AUTO_PROXY_URL) return proxyUrl;
+
+  const appData = String(env.APPDATA || '').trim()
+    || (String(env.USERPROFILE || '').trim() ? path.join(String(env.USERPROFILE).trim(), 'AppData', 'Roaming') : '');
+  if (!appData) {
+    throw vpnxxxProxyError('APPDATA is unavailable', 'VPNXXX_APPDATA_UNAVAILABLE');
+  }
+
+  let configText;
+  try {
+    configText = readBoundedUtf8File(
+      path.join(appData, 'vpnxxx', 'temp', 'privoxy.conf'),
+      VPNXXX_PRIVOXY_CONFIG_MAX_BYTES
+    );
+  } catch (error) {
+    if (error?.code === 'VPNXXX_CONFIG_TOO_LARGE') {
+      throw vpnxxxProxyError('privoxy.conf is too large to read safely', error.code);
+    }
+    throw vpnxxxProxyError('privoxy.conf is unavailable; start or restart vpnxxx', 'VPNXXX_CONFIG_UNAVAILABLE');
+  }
+
+  const listeners = parseVpnxxxPrivoxyListeners(configText);
+  if (listeners.length === 0) {
+    throw vpnxxxProxyError('privoxy.conf has no valid loopback listen-address', 'VPNXXX_LISTENER_NOT_FOUND');
+  }
+  const ports = new Set(listeners.map(listener => new URL(listener).port));
+  if (ports.size > 1) {
+    throw vpnxxxProxyError('privoxy.conf has loopback listen-address entries with different ports', 'VPNXXX_LISTENER_AMBIGUOUS');
+  }
+  return listeners.find(listener => listener.startsWith('http://127.0.0.1:'))
+    || listeners.find(listener => listener.startsWith('http://127.'))
+    || listeners[0];
+}
+
+function readBoundedUtf8File(filePath, maxBytes) {
+  const handle = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let totalBytesRead = 0;
+    while (totalBytesRead < buffer.length) {
+      const bytesRead = fs.readSync(handle, buffer, totalBytesRead, buffer.length - totalBytesRead, null);
+      if (bytesRead === 0) break;
+      totalBytesRead += bytesRead;
+    }
+    if (totalBytesRead > maxBytes) {
+      const error = new Error('File exceeds configured read limit.');
+      error.code = 'VPNXXX_CONFIG_TOO_LARGE';
+      throw error;
+    }
+    return buffer.subarray(0, totalBytesRead).toString('utf8');
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function parseVpnxxxPrivoxyListeners(configText) {
+  const listeners = new Set();
+  for (const rawLine of String(configText || '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, '').trim();
+    if (!line) continue;
+    const match = /^listen-address\s+(\S+)\s*$/i.exec(line);
+    if (!match) continue;
+    const proxyUrl = loopbackProxyUrl(match[1]);
+    if (proxyUrl) listeners.add(proxyUrl);
+  }
+  return [...listeners];
+}
+
+function loopbackProxyUrl(endpoint) {
+  let host;
+  let portText;
+  const bracketedIpv6 = /^\[([^\]]+)\]:(\d+)$/.exec(endpoint);
+  if (bracketedIpv6) {
+    [, host, portText] = bracketedIpv6;
+  } else {
+    const hostAndPort = /^([^:\s]+):(\d+)$/.exec(endpoint);
+    if (!hostAndPort) return '';
+    [, host, portText] = hostAndPort;
+  }
+
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return '';
+
+  const normalizedHost = host.toLowerCase();
+  if (normalizedHost === 'localhost') return `http://127.0.0.1:${port}`;
+  if (net.isIP(normalizedHost) === 4 && Number(normalizedHost.split('.')[0]) === 127) {
+    return `http://${normalizedHost}:${port}`;
+  }
+  if (net.isIP(normalizedHost) === 6 && normalizedHost === '::1') {
+    return `http://[::1]:${port}`;
+  }
+  return '';
+}
+
+function vpnxxxProxyError(reason, code) {
+  return httpError(502, `OpenAI proxy auto-detection failed: ${reason}.`, {
+    transport: 'proxy',
+    proxy: 'vpnxxx',
+    code
+  });
 }
 
 async function createOpenAiResponse(config, payload, signal) {
@@ -6564,6 +6670,7 @@ function isExpectedDisconnect(error) {
 
 export {
   createOpenAiResponse,
+  resolveOpenAiProxyUrl,
   runScheduledOpenAiAction,
   stopScheduledOpenAiAction,
   assertScheduledActionsEditable,
