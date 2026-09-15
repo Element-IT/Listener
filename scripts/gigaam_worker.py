@@ -6,6 +6,8 @@ import tempfile
 import traceback
 import wave
 
+from transcription_runtime import probe_runtime
+
 
 for stream in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
@@ -16,10 +18,9 @@ def write_json(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def load_gigaam_model(args):
+def load_gigaam_model(args, device):
     import gigaam
 
-    device = None if args.device == "auto" else args.device
     return gigaam.load_model(
         args.model,
         fp16_encoder=args.fp16_encoder,
@@ -126,15 +127,26 @@ def main():
     parser.add_argument("--model", default=os.environ.get("GIGAAM_MODEL", "v3_e2e_rnnt"))
     parser.add_argument("--device", default=os.environ.get("GIGAAM_DEVICE", "auto"))
     parser.add_argument("--download-root", default=os.environ.get("GIGAAM_DOWNLOAD_ROOT", ""))
+    parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument("--no-fp16-encoder", dest="fp16_encoder", action="store_false")
     parser.set_defaults(fp16_encoder=True)
     args = parser.parse_args()
 
+    runtime = probe_runtime(args.device)
+    if args.check_runtime:
+        write_json(runtime)
+        return 0
+
     try:
-        model = load_gigaam_model(args)
-        write_json({"type": "ready", "ok": True, "model": args.model, "device": args.device})
+        if not runtime["available"]:
+            raise RuntimeError(runtime.get("error") or "Transcription runtime is unavailable.")
+        model = load_gigaam_model(args, runtime["selectedDevice"])
+        runtime["actualDevice"] = str(next(model.parameters()).device)
+        write_json({"type": "ready", "ok": True, "model": args.model,
+                    "device": runtime["actualDevice"], "runtime": runtime})
     except Exception:
-        write_json({"type": "ready", "ok": False, "error": traceback.format_exc(limit=8)})
+        write_json({"type": "ready", "ok": False, "runtime": runtime,
+                    "error": traceback.format_exc(limit=8)})
         return 1
 
     for line in sys.stdin:

@@ -23,6 +23,15 @@ const STORAGE_KEYS = {
 const elements = {
   configStatus: document.querySelector('#configStatus'),
   settingsSummary: document.querySelector('#settingsSummary'),
+  transcriptionDevice: document.querySelector('#transcriptionDevice'),
+  transcriptionHardware: document.querySelector('#transcriptionHardware'),
+  transcriptionHardwareNote: document.querySelector('#transcriptionHardwareNote'),
+  transcriptionModelPicker: document.querySelector('#transcriptionModelPicker'),
+  transcriptionModelCurrent: document.querySelector('#transcriptionModelCurrent'),
+  transcriptionModelOptions: document.querySelector('#transcriptionModelOptions'),
+  transcriptionModelMetrics: document.querySelector('#transcriptionModelMetrics'),
+  transcriptionModelSource: document.querySelector('#transcriptionModelSource'),
+  transcriptionModelStatus: document.querySelector('#transcriptionModelStatus'),
   channelGrid: document.querySelector('#channelGrid'),
   channelNameFields: document.querySelector('#channelNameFields'),
   activeChannelNumber: document.querySelector('#activeChannelNumber'),
@@ -123,6 +132,13 @@ let openAiRunId = 0;
 let liveTranscriptOffsetSeconds = 0;
 let storageHydrated = false;
 let storageAvailable = false;
+let transcriptionStatusTimer = null;
+let transcriptionStatusLoading = false;
+let transcriptionModelSaving = false;
+let transcriptionModelState = {};
+let transcriptionModelMessage = '';
+let transcriptionModelMessageIsError = false;
+let transcriptionModelRevision = 0;
 const actionRunNotices = new Map();
 
 applySettingsToControls();
@@ -169,6 +185,9 @@ elements.openAiTabButton.addEventListener('click', () => switchTab('openai'));
 elements.settingsButton.addEventListener('click', openSettings);
 elements.settingsCloseButton.addEventListener('click', closeSettings);
 elements.settingsBackdrop.addEventListener('click', closeSettings);
+elements.transcriptionModelOptions.addEventListener('change', event => {
+  if (event.target.matches('input[name="transcriptionModel"]')) saveTranscriptionModel(event.target.value);
+});
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') closeSettings();
 });
@@ -1803,8 +1822,10 @@ async function syncStorage(path, body, options = {}) {
 }
 
 async function loadHealth() {
+  const modelRevision = transcriptionModelRevision;
   try {
     const data = await api('/api/health');
+    if (modelRevision === transcriptionModelRevision) renderTranscriptionStatus(data.transcriber);
     if (!localStorage.getItem(STORAGE_KEYS.settings)) {
       uiSettings = {
         vendor: data.config.vendor || 'auto',
@@ -1835,10 +1856,143 @@ async function loadHealth() {
     elements.settingsSummary.textContent = parts.join(' | ');
     log(data);
   } catch (error) {
+    renderTranscriptionStatus({ error: error.message || String(error) });
     elements.configStatus.textContent = 'Ошибка запуска';
     elements.configStatus.className = 'status-pill warn';
     elements.settingsSummary.textContent = error.message || String(error);
     logError(error);
+  }
+}
+
+function renderTranscriptionStatus(runtime = {}) {
+  renderTranscriptionModels(runtime);
+  const device = runtime.actualDevice || runtime.selectedDevice || '';
+  const label = device.startsWith('cuda') ? 'GPU' : device === 'cpu' ? 'CPU' : 'Нет данных';
+  elements.transcriptionDevice.textContent = runtime.modelState === 'preparing' ? 'Подготовка' : runtime.available ? label : 'Недоступно';
+  elements.transcriptionDevice.className = `status-pill ${runtime.available ? 'good' : 'warn'}`;
+  const modelStates = { preparing: 'Подготовка окружения', not_loaded: 'Не загружена', loading: 'Загрузка модели', ready: 'Готова', transcribing: 'Распознавание', error: 'Ошибка модели' };
+  const rows = [
+    [runtime.actualDevice ? 'Устройство модели' : 'Выбрано для запуска', device || 'Не определено'],
+    ['Состояние', modelStates[runtime.modelState] || 'Проверка не выполнена'],
+    ['Модель', runtime.model || 'Не определена'],
+    ['Режим', runtime.requestedDevice === 'auto' ? 'Автоматически' : runtime.requestedDevice || 'Не определён'],
+    ['CUDA', runtime.cuda?.available === true ? `Доступна · ${runtime.cuda.version || ''}`.trim() : runtime.cuda?.available === false ? 'Недоступна' : 'Не проверена'],
+    ['PyTorch', runtime.torchVersion || 'Не определён']
+  ];
+  if (runtime.setup?.source) rows.push(['Окружение', runtime.setup.source === 'managed' ? 'Автоматическое' : 'Из конфигурации']);
+  const gpus = runtime.gpus || [];
+  for (const [index, gpu] of gpus.entries()) {
+    const memory = Number(gpu.totalMemoryBytes);
+    const memoryLabel = memory > 0 ? ` · ${(memory / (1024 ** 3)).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} ГБ` : '';
+    rows.push([gpus.length > 1 ? `Видеокарта ${index + 1}` : 'Видеокарта', `${gpu.name}${memoryLabel}`]);
+    if (gpu.driverVersion) rows.push(['Драйвер NVIDIA', gpu.driverVersion]);
+  }
+  if (!gpus.length) rows.push(['Видеокарта NVIDIA', 'Не обнаружена']);
+  elements.transcriptionHardware.innerHTML = rows.map(([title, value]) => `<div><dt>${escapeHtml(title)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
+  const reasons = {
+    torch_cpu_only: 'PyTorch установлен без поддержки CUDA. Транскрибация выполняется на CPU.',
+    cuda_unavailable: 'CUDA недоступна для PyTorch. Для транскрибации выбран CPU.',
+    cuda_check_failed: 'Проверка вычислений CUDA завершилась ошибкой.',
+    cpu_requested: 'CPU выбран в конфигурации сервера.'
+  };
+  const setupMessages = {
+    checking: 'Проверка CPU, видеокарты и установленных сборок.',
+    creating: 'Создание отдельного Python-окружения.',
+    installing_torch: `Установка PyTorch и TorchAudio (${runtime.setup?.variant === 'cu128' ? 'CUDA 12.8' : 'CPU'}).`,
+    installing_gigaam: 'Установка GigaAM и зависимостей.',
+    verifying: 'Проверка установленной сборки и вычислений CUDA.'
+  };
+  elements.transcriptionHardwareNote.textContent = setupMessages[runtime.setup?.stage] || [
+    runtime.setup?.error ? `Подготовка сборки: ${runtime.setup.error}` : '',
+    runtime.modelError || runtime.error || reasons[runtime.reason] || '',
+    runtime.cuda?.error || ''
+  ].filter(Boolean).join(' ');
+  elements.transcriptionHardwareNote.hidden = !elements.transcriptionHardwareNote.textContent;
+}
+
+function transcriptionModelMetrics(model) {
+  if (!model) return '';
+  return [
+    ['Скорость', model.speed, 'speed', `Ориентировочная скорость: ${model.speed} из 5. Зависит от CPU/GPU, длины и содержания аудио; не замер на этом компьютере.`],
+    ['Качество', model.quality, 'quality', `Относительная оценка: ${model.quality} из 5. Средний WER ${model.wer}%. Это не процент точности на ваших записях.`]
+  ].map(([label, value, kind, title]) => `<span class="transcription-model-metric ${kind}" title="${escapeHtml(title)}">
+    <span>${label}</span><meter min="0" max="5" value="${value}" aria-label="${escapeHtml(`${model.name}: ${label}`)}">${value}/5</meter>
+    <strong>${kind === 'speed' ? '~' : ''}${Number(value).toLocaleString('ru-RU')}/5</strong>
+  </span>`).join('');
+}
+
+function renderTranscriptionModels(runtime = {}) {
+  if (Array.isArray(runtime.models) && !transcriptionModelSaving) {
+    if (runtime.model !== transcriptionModelState.model && !transcriptionModelMessageIsError) transcriptionModelMessage = '';
+    transcriptionModelState = runtime;
+  }
+  const state = transcriptionModelState;
+  const models = state.models || [];
+  const selected = models.find(model => model.id === state.model);
+  const signature = JSON.stringify(models);
+  if (elements.transcriptionModelOptions.dataset.models !== signature) {
+    elements.transcriptionModelOptions.dataset.models = signature;
+    elements.transcriptionModelOptions.innerHTML = models.map(model => `<label class="transcription-model-option">
+      <input type="radio" name="transcriptionModel" value="${escapeHtml(model.id)}" aria-label="${escapeHtml(model.name)}">
+      <span class="transcription-model-option-body"><strong>${escapeHtml(model.name)}</strong>
+        <small>${model.punctuation ? 'Пунктуация и числа' : 'Без пунктуации'} · WER ${Number(model.wer).toLocaleString('ru-RU')}%</small>
+        <span class="transcription-model-metrics">${transcriptionModelMetrics(model)}</span>
+      </span>
+    </label>`).join('');
+  }
+  for (const input of elements.transcriptionModelOptions.querySelectorAll('input')) {
+    input.checked = input.value === state.model;
+    input.disabled = transcriptionModelSaving || !state.modelChangeAllowed || !Array.isArray(runtime.models);
+  }
+  elements.transcriptionModelCurrent.textContent = selected?.name || state.model || 'Загрузка...';
+  elements.transcriptionModelMetrics.innerHTML = transcriptionModelMetrics(selected);
+  if (state.modelSource?.startsWith('https://github.com/salute-developers/GigaAM/')) {
+    elements.transcriptionModelSource.href = state.modelSource;
+    elements.transcriptionModelSource.hidden = false;
+  }
+  const status = transcriptionModelSaving ? 'Сохранение модели...'
+    : !Array.isArray(runtime.models) ? 'Список моделей недоступен.'
+    : transcriptionModelMessageIsError ? transcriptionModelMessage : state.modelChangeReason || transcriptionModelMessage;
+  elements.transcriptionModelStatus.textContent = status;
+  elements.transcriptionModelStatus.hidden = !status;
+  elements.transcriptionModelStatus.classList.toggle('error', transcriptionModelMessageIsError);
+}
+
+async function saveTranscriptionModel(model) {
+  if (transcriptionModelSaving || !transcriptionModelState.modelChangeAllowed) return;
+  transcriptionModelSaving = true;
+  transcriptionModelRevision += 1;
+  transcriptionModelMessage = '';
+  transcriptionModelMessageIsError = false;
+  elements.transcriptionModelPicker.open = false;
+  renderTranscriptionModels(transcriptionModelState);
+  try {
+    const data = await api('/api/transcription/model', { method: 'POST', body: { model } });
+    transcriptionModelState = data.transcriber;
+    transcriptionModelMessage = 'Модель сохранена.';
+  } catch (error) {
+    transcriptionModelMessage = `Не удалось сменить модель: ${error.message || String(error)}`;
+    transcriptionModelMessageIsError = true;
+  } finally {
+    transcriptionModelSaving = false;
+    transcriptionModelRevision += 1;
+    renderTranscriptionStatus(transcriptionModelState);
+    elements.transcriptionModelPicker.querySelector('summary').focus();
+    refreshTranscriptionStatus();
+  }
+}
+
+async function refreshTranscriptionStatus() {
+  if (transcriptionStatusLoading || document.hidden) return;
+  transcriptionStatusLoading = true;
+  const modelRevision = transcriptionModelRevision;
+  try {
+    const data = await api('/api/transcription/status');
+    if (modelRevision === transcriptionModelRevision) renderTranscriptionStatus(data.transcriber);
+  } catch (error) {
+    renderTranscriptionStatus({ error: error.message || String(error) });
+  } finally {
+    transcriptionStatusLoading = false;
   }
 }
 
@@ -2221,12 +2375,17 @@ function openSettings() {
   elements.settingsBackdrop.hidden = false;
   elements.settingsDrawer.classList.add('open');
   elements.settingsDrawer.setAttribute('aria-hidden', 'false');
+  refreshTranscriptionStatus();
+  clearInterval(transcriptionStatusTimer);
+  transcriptionStatusTimer = window.setInterval(refreshTranscriptionStatus, 5000);
 }
 
 function closeSettings() {
   elements.settingsBackdrop.hidden = true;
   elements.settingsDrawer.classList.remove('open');
   elements.settingsDrawer.setAttribute('aria-hidden', 'true');
+  clearInterval(transcriptionStatusTimer);
+  transcriptionStatusTimer = null;
 }
 
 function applySettingsToControls() {

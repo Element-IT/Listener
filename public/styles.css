@@ -1091,6 +1091,212 @@ tr:last-child td {
   line-height: 1.45;
 }
 
+.transcription-hardware-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.transcription-hardware-heading h3 {
+  margin: 0;
+}
+
+.transcription-hardware-heading .status-pill {
+  width: auto;
+  min-width: 90px;
+  min-height: 30px;
+  padding: 4px 8px;
+  flex-shrink: 0;
+  justify-content: center;
+  color: var(--muted);
+  background: var(--surface-soft);
+  border-color: var(--border);
+  font-weight: 750;
+}
+
+.transcription-hardware-heading .status-pill.good {
+  color: var(--accent-strong);
+  background: var(--surface-strong);
+}
+
+.transcription-hardware-heading .status-pill.warn {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.transcription-hardware {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.transcription-model-control {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.transcription-model-picker {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.transcription-model-picker summary {
+  padding: 12px;
+  cursor: pointer;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.transcription-model-picker summary:focus-visible,
+.transcription-model-option:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.transcription-model-options {
+  max-height: 380px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.transcription-model-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  margin: 0;
+  padding: 12px 9px;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.transcription-model-option:has(input:checked) {
+  background: var(--surface-strong);
+}
+
+.transcription-model-option:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.transcription-model-option input {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.transcription-model-option-body,
+.transcription-model-metrics {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.transcription-model-option-body > strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.transcription-model-option-body > small,
+.transcription-model-caption,
+.transcription-model-status {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.transcription-model-metric {
+  display: grid;
+  grid-template-columns: 62px minmax(24px, 1fr) 44px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.transcription-model-metric strong {
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.transcription-model-metric meter {
+  width: 100%;
+  height: 12px;
+}
+
+.transcription-model-metric meter::-webkit-meter-bar {
+  background: #e8edf0;
+  border: 0;
+}
+
+.transcription-model-metric.speed meter::-webkit-meter-optimum-value {
+  background: #3278a0;
+}
+
+.transcription-model-metric.quality meter::-webkit-meter-optimum-value {
+  background: var(--accent);
+}
+
+.transcription-model-metric.speed meter::-moz-meter-bar {
+  background: #3278a0;
+}
+
+.transcription-model-metric.quality meter::-moz-meter-bar {
+  background: var(--accent);
+}
+
+.transcription-model-source {
+  color: var(--accent-strong);
+  font-size: 12px;
+  width: fit-content;
+}
+
+.transcription-model-status.error {
+  color: #a42d35;
+}
+
+.transcription-hardware > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr);
+  gap: 12px;
+}
+
+.transcription-hardware dt {
+  color: var(--muted);
+}
+
+.transcription-hardware dd {
+  margin: 0;
+  font-weight: 650;
+}
+
+.transcription-hardware dd,
+.transcription-hardware dt,
+.transcription-hardware-note {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.transcription-hardware-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .channel-name-fields {
   display: grid;
   gap: 8px;

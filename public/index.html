@@ -329,6 +329,28 @@
           <button id="settingsCloseButton" class="icon-button subtle" type="button" aria-label="Закрыть настройки" title="Закрыть">×</button>
         </div>
 
+        <section class="settings-section" aria-labelledby="transcriptionHardwareTitle">
+          <div class="transcription-hardware-heading">
+            <h3 id="transcriptionHardwareTitle">Транскрибация</h3>
+            <span id="transcriptionDevice" class="status-pill">Проверка</span>
+          </div>
+          <div class="transcription-model-control">
+            <span id="transcriptionModelLabel">Модель распознавания</span>
+            <details id="transcriptionModelPicker" class="transcription-model-picker">
+              <summary aria-labelledby="transcriptionModelLabel transcriptionModelCurrent">
+                <span id="transcriptionModelCurrent">Загрузка...</span>
+              </summary>
+              <div id="transcriptionModelOptions" class="transcription-model-options" role="radiogroup" aria-labelledby="transcriptionModelLabel"></div>
+            </details>
+            <div id="transcriptionModelMetrics" class="transcription-model-metrics"></div>
+            <p class="transcription-model-caption">Скорость: оценка · Качество: по WER</p>
+            <a id="transcriptionModelSource" class="transcription-model-source" target="_blank" rel="noopener noreferrer" hidden>Сравнение GigaAM</a>
+            <p id="transcriptionModelStatus" class="transcription-model-status" role="status" aria-live="polite" hidden></p>
+          </div>
+          <dl id="transcriptionHardware" class="transcription-hardware"></dl>
+          <p id="transcriptionHardwareNote" class="transcription-hardware-note" role="status">Проверка Python и CUDA…</p>
+        </section>
+
         <section class="settings-section" aria-label="Общие параметры">
           <h3>Общие параметры</h3>
           <label>

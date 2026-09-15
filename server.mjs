@@ -9,6 +9,7 @@ import tls from 'node:tls';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import pg from 'pg';
+import { createTranscriptionModelSettings } from './transcription-models.mjs';
 
 const { Client, Pool } = pg;
 
@@ -18,6 +19,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const RUNTIME_DIR = path.join(__dirname, '.runtime');
 const TRANSCRIPT_DIR = path.join(process.env.TEMP || process.env.TMP || RUNTIME_DIR, 'camera-audio-listener-transcripts');
 const GIGAAM_WORKER_SCRIPT = path.join(__dirname, 'scripts', 'gigaam_worker.py');
+const GIGAAM_SETUP_SCRIPT = path.join(__dirname, 'scripts', 'prepare_transcription.py');
 
 loadDotEnv(path.join(__dirname, '.env'));
 
@@ -33,13 +35,37 @@ const ACTION_SCHEDULER_RETRY_DELAYS_MS = [60, 300, 900, 1800, 3600].map(seconds 
 const ACTION_SCHEDULER_RETRY_MAX_AGE_MS = Math.max(1, numberFromEnv('ACTION_SCHEDULER_RETRY_MAX_AGE_HOURS', 168)) * 60 * 60 * 1000;
 const MANUAL_ACTION_CLAIM_TTL_MS = Math.max(1, numberFromEnv('MANUAL_ACTION_CLAIM_TTL_HOURS', 36)) * 60 * 60 * 1000;
 let gigaAmWorkerState = null;
+let gigaAmWorkerError = '';
 let transcriberCheckPromise = null;
+let transcriberCheckKey = '';
+let transcriptionPythonPath = '';
+let transcriptionSetup = { stage: 'not_started' };
+let transcriptionSetupRuntime = {};
 let databasePoolPromise = null;
 let actionSchedulerTimer = null;
 let actionSchedulerRunning = false;
 let actionSchedulerStateMutation = Promise.resolve();
 const activeScheduledActions = new Set();
 const activeManualActions = new Map();
+let activeTranscriptionRequests = 0;
+const transcriptionModelSettings = createTranscriptionModelSettings({
+  defaultModel: process.env.GIGAAM_MODEL || 'v3_e2e_rnnt',
+  read: () => readAppSetting('transcription_model'),
+  write: model => writeAppSetting('transcription_model', model),
+  busyReason: () => {
+    if (transcriptionPreparationPending(transcriptionSetup)) return 'Выполняется подготовка окружения транскрибации.';
+    if (activeTranscriptionRequests || activeScheduledActions.size
+      || (gigaAmWorkerState && !gigaAmWorkerState.closed && (!gigaAmWorkerState.runtimeInfo || gigaAmWorkerState.pending.size))) {
+      return 'Выполняется транскрибация или фоновое действие. Смена модели временно недоступна.';
+    }
+    return '';
+  },
+  onChange: () => {
+    if (gigaAmWorkerState && !gigaAmWorkerState.closed) gigaAmWorkerState.stop();
+    gigaAmWorkerState = null;
+    gigaAmWorkerError = '';
+  }
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -54,8 +80,20 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         config: publicConfig(),
         ffmpeg: await checkFfmpeg(),
-        transcriber: await checkTranscriber()
+        transcriber: await readTranscriptionStatus()
       });
+    }
+
+    if (url.pathname === '/api/transcription/status') {
+      requireMethod(req, 'GET');
+      return json(res, 200, { ok: true, transcriber: await readTranscriptionStatus() });
+    }
+
+    if (url.pathname === '/api/transcription/model') {
+      requireMethod(req, 'POST');
+      const payload = await readJsonBody(req, 4096);
+      await transcriptionModelSettings.save(payload.model);
+      return json(res, 200, { ok: true, transcriber: await readTranscriptionStatus() });
     }
 
     if (url.pathname === '/api/probe') {
@@ -88,11 +126,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/live/transcript') {
-      return await transcribeAudio(req, res, cameraConfig(), url.searchParams, 'live');
+      return await handleTranscriptionRequest(req, res, url.searchParams, 'live');
     }
 
     if (url.pathname === '/api/recordings/transcript') {
-      return await transcribeAudio(req, res, cameraConfig(), url.searchParams, 'archive');
+      return await handleTranscriptionRequest(req, res, url.searchParams, 'archive');
     }
 
     if (url.pathname === '/api/openai/ask') {
@@ -114,8 +152,14 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (isMainModule()) {
-  server.listen(PORT, () => {
+  server.listen(PORT, async () => {
     console.log(`Camera audio app: http://localhost:${PORT}`);
+    await transcriptionModelSettings.initialize().catch(error => console.warn(`Transcription model settings: ${error.message}`));
+    const runtime = await prepareTranscriber();
+    console.log(`Transcription startup check: ${runtime.selectedDevice || 'unavailable'}; PyTorch ${runtime.torchVersion || 'unknown'}; CUDA ${runtime.cuda?.available ? 'available' : 'unavailable'}; GPU: ${(runtime.gpus || []).map(gpu => gpu.name).join(', ') || 'not detected'}`);
+    if (runtime.error || runtime.reason === 'torch_cpu_only') {
+      console.warn(`Transcription: ${runtime.error || 'PyTorch is CPU-only; CUDA acceleration is unavailable.'}`);
+    }
     startActionScheduler();
   });
 }
@@ -191,8 +235,8 @@ function cameraConfig() {
     hikvisionTimeMode: (process.env.HIKVISION_TIME_MODE || 'local').toLowerCase(),
     audioFilter: normalizeAudioFilter(process.env.AUDIO_FILTER || 'voice'),
     xmAudioCodec: normalizeXmAudioCodec(process.env.XM_AUDIO_CODEC || 'mulaw'),
-    pythonPath: process.env.PYTHON_PATH || 'python',
-    gigaamModel: process.env.GIGAAM_MODEL || 'v3_e2e_rnnt',
+    pythonPath: transcriptionPythonPath || process.env.PYTHON_PATH || 'python',
+    gigaamModel: transcriptionModelSettings.model,
     gigaamDevice: process.env.GIGAAM_DEVICE || 'auto',
     gigaamDownloadRoot: process.env.GIGAAM_DOWNLOAD_ROOT || defaultGigaAmDownloadRoot(),
     transcriptionChunkSeconds: numberFromEnv('TRANSCRIPTION_CHUNK_SECONDS', 20),
@@ -2848,6 +2892,18 @@ async function streamAudio(req, res, config, params, mode) {
   });
 }
 
+async function handleTranscriptionRequest(req, res, params, mode) {
+  assertTranscriptionPrepared();
+  await transcriptionModelSettings.initialize().catch(() => {});
+  if (transcriptionModelSettings.saving) throw httpError(503, 'Выбор модели сохраняется. Повторите запрос после сохранения.');
+  activeTranscriptionRequests += 1;
+  try {
+    return await transcribeAudio(req, res, cameraConfig(), params, mode);
+  } finally {
+    activeTranscriptionRequests -= 1;
+  }
+}
+
 async function transcribeAudio(req, res, config, params, mode) {
   requireCameraAuth(config);
 
@@ -5390,6 +5446,7 @@ function getGigaAmWorker(config) {
 }
 
 function createGigaAmWorker(config, key) {
+  gigaAmWorkerError = '';
   const args = [
     GIGAAM_WORKER_SCRIPT,
     '--model',
@@ -5479,11 +5536,13 @@ function createGigaAmWorker(config, key) {
   });
 
   child.on('error', error => {
+    gigaAmWorkerError = error.message;
     state.readyReject(error);
     rejectPendingWorkerRequests(state, error);
   });
 
   child.on('close', code => {
+    const unexpectedExit = !state.closed;
     state.closed = true;
     if (gigaAmWorkerState === state) {
       gigaAmWorkerState = null;
@@ -5491,6 +5550,7 @@ function createGigaAmWorker(config, key) {
 
     const message = `GigaAM worker exited with code ${code ?? 'unknown'}. ${state.stderr}`.trim();
     const error = httpError(503, message);
+    if (unexpectedExit && !gigaAmWorkerError) gigaAmWorkerError = message;
     state.readyReject(error);
     rejectPendingWorkerRequests(state, error);
   });
@@ -5501,8 +5561,11 @@ function createGigaAmWorker(config, key) {
 function handleGigaAmWorkerMessage(state, message) {
   if (message.type === 'ready') {
     if (message.ok) {
+      state.runtimeInfo = message.runtime || { actualDevice: message.device };
+      gigaAmWorkerError = '';
       state.readyResolve(message);
     } else {
+      gigaAmWorkerError = message.error || 'GigaAM failed to start.';
       state.readyReject(httpError(503, `GigaAM failed to start. ${message.error || ''}`.trim()));
     }
     return;
@@ -5964,72 +6027,173 @@ function checkFfmpeg(command = cameraConfig().ffmpegPath) {
   });
 }
 
-function checkTranscriber(command = cameraConfig().pythonPath) {
-  if (transcriberCheckPromise) return transcriberCheckPromise;
+function transcriptionRuntimeStatus(runtime, worker, modelError = '') {
+  const active = worker && !worker.closed ? worker : null;
+  return {
+    ...runtime,
+    ...(active?.runtimeInfo || {}),
+    actualDevice: active?.runtimeInfo?.actualDevice || null,
+    available: Boolean(runtime.available && !modelError),
+    modelState: modelError ? 'error' : !active ? 'not_loaded'
+      : !active.runtimeInfo ? 'loading' : active.pending.size ? 'transcribing' : 'ready',
+    modelError: modelError || undefined
+  };
+}
 
-  const code = [
-    'import importlib.metadata',
-    'import importlib.util',
-    'import json',
-    'spec = importlib.util.find_spec("gigaam")',
-    'version = ""',
-    'if spec is not None:',
-    '    version = importlib.metadata.version("gigaam")',
-    'print(json.dumps({"available": spec is not None, "package": "gigaam", "version": version}))'
-  ].join('\n');
+async function readTranscriptionStatus() {
+  await transcriptionModelSettings.initialize().catch(() => {});
+  const modelSettings = transcriptionModelSettings.snapshot();
+  if (transcriptionPreparationPending(transcriptionSetup)) {
+    return {
+      ...transcriptionSetupRuntime, available: false, actualDevice: null,
+      ...modelSettings, modelState: 'preparing', setup: transcriptionSetup
+    };
+  }
+  const runtime = await checkTranscriber();
+  return {
+    ...transcriptionRuntimeStatus(runtime, gigaAmWorkerState, gigaAmWorkerError),
+    ...modelSettings,
+    setup: transcriptionSetup
+  };
+}
+
+function transcriptionPreparationPending(setup) {
+  return ['checking', 'creating', 'installing_torch', 'installing_gigaam', 'verifying'].includes(setup.stage);
+}
+
+function assertTranscriptionPrepared() {
+  if (transcriptionPreparationPending(transcriptionSetup)) {
+    throw httpError(503, 'Подготовка окружения транскрибации ещё выполняется. Дождитесь окончания установки в настройках.');
+  }
+}
+
+async function prepareTranscriber() {
+  const config = cameraConfig();
+  transcriptionSetup = { stage: 'checking' };
+  try {
+    const result = await runTranscriptionSetup(config, update => {
+      if (update.runtime) transcriptionSetupRuntime = update.runtime;
+      transcriptionSetup = { stage: update.stage, variant: update.variant || transcriptionSetup.variant };
+      console.log(`Transcription setup: ${update.stage}${update.variant ? ` (${update.variant})` : ''}`);
+    });
+    transcriptionPythonPath = result.pythonPath;
+    transcriptionSetup = {
+      stage: result.setupError ? 'fallback' : 'ready',
+      source: result.source,
+      variant: result.runtime?.cuda?.version ? `CUDA ${result.runtime.cuda.version}` : 'CPU',
+      error: result.setupError || undefined
+    };
+    transcriberCheckKey = JSON.stringify({ command: transcriptionPythonPath, device: config.gigaamDevice });
+    transcriberCheckPromise = Promise.resolve({ ...result.runtime, command: transcriptionPythonPath });
+    if (result.setupError) console.warn(`Transcription setup: ${result.setupError}`);
+  } catch (error) {
+    transcriptionSetup = { stage: 'fallback', source: 'configured', error: error.message };
+    console.warn(`Transcription setup: ${error.message}`);
+  }
+  return checkTranscriber();
+}
+
+function runTranscriptionSetup(config, onProgress, options = {}) {
+  return new Promise((resolve, reject) => {
+    const args = [GIGAAM_SETUP_SCRIPT, '--device', config.gigaamDevice,
+      '--runtime-dir', process.env.GIGAAM_RUNTIME_DIR || path.join(RUNTIME_DIR, 'python')];
+    if (!booleanFromEnv('GIGAAM_AUTO_INSTALL', true)) args.push('--no-install');
+    const child = (options.spawnProcess || spawn)(config.pythonPath, args, {
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: gigaAmWorkerEnvironment(config)
+    });
+    let buffer = '';
+    let stderr = '';
+    let result;
+    let failure;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      finish(new Error('Transcription runtime setup timed out.'));
+    }, options.timeoutMs || 65 * 60 * 1000);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = (lines.pop() || '').slice(-64000);
+      for (const line of lines) {
+        const message = safeJsonParse(line);
+        if (message?.stage === 'done') result = message;
+        else if (message?.stage === 'failed') failure = message.error;
+        else if (message?.stage && transcriptionPreparationPending(message)) onProgress(message);
+      }
+    });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString('utf8')).slice(-1500); });
+    child.on('error', error => finish(error));
+    child.on('close', code => {
+      if (code === 0 && result?.pythonPath && typeof result.runtime?.available === 'boolean') {
+        finish(null, result);
+      } else {
+        finish(new Error(failure || stderr.trim() || 'Invalid transcription setup response.'));
+      }
+    });
+  });
+}
+
+function checkTranscriber(command = cameraConfig().pythonPath) {
+  const config = cameraConfig();
+  const key = JSON.stringify({ command, device: config.gigaamDevice });
+  if (transcriberCheckPromise && transcriberCheckKey === key) return transcriberCheckPromise;
+  transcriberCheckKey = key;
 
   transcriberCheckPromise = new Promise(resolve => {
     let child;
+    let timer;
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ command, package: 'gigaam', requestedDevice: config.gigaamDevice, ...result });
+    };
 
     try {
-      child = spawn(command, ['-c', code], {
+      child = spawn(command, [GIGAAM_WORKER_SCRIPT, '--check-runtime', '--device', config.gigaamDevice], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
+        windowsHide: true,
+        env: gigaAmWorkerEnvironment(config)
       });
     } catch (error) {
-      resolve({
-        available: false,
-        command,
-        error: error.message
-      });
+      finish({ available: false, error: error.message });
       return;
     }
 
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       child.kill('SIGTERM');
-      resolve({
-        available: false,
-        command,
-        error: 'Python/GigaAM check timed out.'
-      });
-    }, 15000);
+      finish({ available: false, error: 'Python/GigaAM/CUDA check timed out.' });
+    }, 30000);
 
     child.stdout.on('data', chunk => {
-      stdout = (stdout + chunk.toString('utf8')).slice(-1000);
+      stdout = (stdout + chunk.toString('utf8')).slice(-64000);
     });
     child.stderr.on('data', chunk => {
       stderr = (stderr + chunk.toString('utf8')).slice(-1000);
     });
     child.on('error', error => {
-      clearTimeout(timer);
-      resolve({
-        available: false,
-        command,
-        error: error.message
-      });
+      finish({ available: false, error: error.message });
     });
     child.on('close', codeValue => {
-      clearTimeout(timer);
-      const parsed = safeJsonParse(stdout);
-      resolve({
+      const parsed = stdout.trim().split(/\r?\n/).map(line => safeJsonParse(line)).reverse()
+        .find(value => value && typeof value.available === 'boolean');
+      finish({
+        ...parsed,
         available: codeValue === 0 && Boolean(parsed?.available),
-        command,
         code: codeValue,
-        package: parsed?.package || 'gigaam',
-        version: parsed?.version || '',
-        error: codeValue === 0 ? undefined : stderr.trim()
+        error: codeValue === 0 && parsed ? parsed.error
+          : stderr.trim() || 'Python/GigaAM check returned an invalid response.'
       });
     });
   });
@@ -6154,6 +6318,11 @@ function isExpectedDisconnect(error) {
 }
 
 export {
+  transcriptCacheKey,
+  runTranscriptionSetup,
+  transcriptionPreparationPending,
+  transcriptionRuntimeStatus,
+  checkTranscriber,
   actionLastRunMatchesCandidate,
   buildReportDocxAttachment,
   isWeekendDatePart,
