@@ -274,6 +274,160 @@ h4 {
   display: none;
 }
 
+.audio-files-drop-zone {
+  gap: 12px;
+  padding: 24px;
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+  cursor: pointer;
+}
+
+.audio-files-drop-zone strong {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.audio-files-drop-zone input {
+  padding: 8px;
+}
+
+.audio-files-drop-zone.is-dragging {
+  border-color: var(--accent);
+  background: var(--surface-strong);
+}
+
+.audio-files-drop-zone.is-busy {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.audio-files-hint {
+  line-height: 1.5;
+}
+
+.audio-files-list {
+  display: grid;
+  gap: 8px;
+  margin: 18px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.audio-file-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.audio-file-item > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.audio-file-item .muted-line {
+  display: block;
+  font-size: 12px;
+}
+
+.audio-file-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.audio-file-status.done {
+  color: var(--accent);
+}
+
+.audio-file-status.error,
+.audio-file-preview-notice {
+  color: var(--red);
+}
+
+.audio-file-remove {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 10px;
+  font-size: 20px;
+}
+
+.audio-files-actions {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.audio-files-download {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  padding: 0 14px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--accent-strong);
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.audio-files-download[hidden],
+.audio-files-progress[hidden] {
+  display: none;
+}
+
+.audio-files-progress {
+  margin-top: 18px;
+}
+
+.audio-files-progress progress {
+  width: 100%;
+  height: 12px;
+  accent-color: var(--accent);
+}
+
+.transcript-text.audio-files-transcript {
+  min-height: 220px;
+  max-height: 500px;
+}
+
+.audio-file-preview + .audio-file-preview {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.audio-file-preview > strong {
+  overflow-wrap: anywhere;
+}
+
+.audio-file-preview pre {
+  margin: 8px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.audio-file-preview-notice {
+  font-size: 13px;
+}
+
+@media (max-width: 560px) {
+  .audio-files-drop-zone {
+    padding: 14px;
+  }
+
+  .audio-file-item {
+    gap: 8px;
+  }
+
+  .audio-file-status {
+    max-width: 82px;
+  }
+}
+
 .muted-line {
   margin-top: 6px;
   color: var(--muted);
@@ -586,6 +740,10 @@ h4 {
 
 .question-field {
   margin-bottom: 12px;
+}
+
+.question-field[hidden] {
+  display: none;
 }
 
 .openai-progress {

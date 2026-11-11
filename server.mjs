@@ -5,11 +5,29 @@ import https from 'node:https';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { PassThrough } from 'node:stream';
 import tls from 'node:tls';
+import { setTimeout as waitFor } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import pg from 'pg';
 import { createTranscriptionModelSettings } from './transcription-models.mjs';
+import { createGoogleDriveClient, readGoogleDriveConfig } from './google-drive.mjs';
+import { handleAudioFileTranscription, validateAudioUpload } from './audio-files.mjs';
+import { assessIntervalCoverage, isTranscriptCachePayloadComplete } from './transcript-coverage.mjs';
+import { createPcmSpool } from './pcm-spool.mjs';
+import { createDeliveryOutbox, createMemoryDeliveryOutbox } from './delivery-outbox.mjs';
+import { createDriveDeliveryWorker } from './drive-delivery.mjs';
+import { XM_RECOVERY_PIPELINE, xmRecoveryPlans, readXmRecoveryPcm, shouldRecoverXmRecordingFromCache } from './xm-block-recovery.mjs';
+import {
+  convertLocalDateTime,
+  formatDateTimeInZone,
+  localDateTimeInZone,
+  normalizeTimeZone,
+  offsetDatePart as offsetZonedDatePart,
+  zonedDatePart,
+  zonedDateTimeToEpochMs
+} from './time-zones.mjs';
 import { ProxyAgent } from 'undici';
 
 const { Client, Pool } = pg;
@@ -26,10 +44,10 @@ const VPNXXX_PRIVOXY_CONFIG_MAX_BYTES = 64 * 1024;
 
 loadDotEnv(path.join(__dirname, '.env'));
 
-const PORT = numberFromEnv('PORT', 3000);
+const PORT = numberFromEnv('PORT', 37841);
 const DEFAULT_TIMEOUT_MS = 10000;
 const XM_NO_RECORD_RET_CODES = new Set([119]);
-const DATABASE_SCHEMA_VERSION = 2;
+const DATABASE_SCHEMA_VERSION = 3;
 const ACTION_SCHEDULER_STATE_KEY = 'action_scheduler_state';
 const ACTION_SCHEDULER_ENABLED = !process.argv.includes('--no-action-scheduler')
   && booleanFromEnv('ACTION_SCHEDULER_ENABLED', true);
@@ -42,6 +60,7 @@ let gigaAmWorkerError = '';
 let gigaAmTranscriptionQueue = Promise.resolve();
 let transcriberCheckPromise = null;
 let transcriberCheckKey = '';
+const ffmpegCheckCache = new Map();
 let transcriptionPythonPath = '';
 let transcriptionSetup = { stage: 'not_started' };
 let transcriptionSetupRuntime = {};
@@ -53,6 +72,10 @@ const activeScheduledActions = new Set();
 const scheduledActionRuntime = new Map();
 const activeManualActions = new Map();
 let activeTranscriptionRequests = 0;
+let activeUploadedTranscriptions = 0;
+let googleDriveClientState = null;
+let driveDeliveryOutbox;
+let driveDeliveryWorker;
 const transcriptionModelSettings = createTranscriptionModelSettings({
   defaultModel: process.env.GIGAAM_MODEL || 'v3_e2e_rnnt',
   read: () => readAppSetting('transcription_model'),
@@ -94,6 +117,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, transcriber: await readTranscriptionStatus() });
     }
 
+    if (url.pathname === '/api/audio-files/transcript') {
+      return await transcribeUploadedFile(req, res, url.searchParams);
+    }
+
     if (url.pathname === '/api/transcription/model') {
       requireMethod(req, 'POST');
       const payload = await readJsonBody(req, 4096);
@@ -120,8 +147,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/recordings/search') {
-      const result = await searchRecordings(cameraConfig(), url.searchParams);
-      return json(res, 200, result);
+      const normalized = normalizeRecordingSearchTimeRange(url.searchParams);
+      const result = await searchRecordings(cameraConfig(), normalized.params);
+      return json(res, 200, { ...result, ...normalized.publicRange });
     }
 
     if (url.pathname === '/api/recordings/file') {
@@ -150,6 +178,15 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/reports/send') {
       return await sendReportEmail(req, res);
+    }
+
+    if (url.pathname === '/api/drive/status') {
+      requireMethod(req, 'GET');
+      return json(res, 200, { ok: true, drive: publicGoogleDriveConfig() });
+    }
+
+    if (url.pathname === '/api/drive/transcripts') {
+      throw httpError(409, 'Прямая выгрузка из старой вкладки отключена. Обновите страницу и запустите действие: сервер проверит полноту и сохранит TXT в очередь отправки.');
     }
 
     if (url.pathname.startsWith('/api/')) {
@@ -253,6 +290,8 @@ function cameraConfig() {
     transcriptionChunkSeconds: numberFromEnv('TRANSCRIPTION_CHUNK_SECONDS', 20),
     transcriptionLiveSeconds: numberFromEnv('TRANSCRIPTION_LIVE_SECONDS', 18),
     transcriptionCaptureChunkSeconds: numberFromEnv('TRANSCRIPTION_CAPTURE_CHUNK_SECONDS', 30),
+    transcriptionRecordingConcurrency: clampNumber(numberFromEnv('TRANSCRIPTION_RECORDING_CONCURRENCY', 1), 1, 4),
+    transcriptionXmProgressive: booleanFromEnv('TRANSCRIPTION_XM_PROGRESSIVE', false),
     transcriptionArchiveMaxSeconds: numberFromEnv('TRANSCRIPTION_ARCHIVE_MAX_SECONDS', 0),
     transcriptionTimeoutMs: numberFromEnv('TRANSCRIPTION_TIMEOUT_MS', 30 * 60 * 1000),
     transcriptionCaptureTimeoutMs: numberFromEnv('TRANSCRIPTION_CAPTURE_TIMEOUT_MS', 30 * 60 * 1000)
@@ -292,6 +331,8 @@ function publicConfig() {
       chunkSeconds: config.transcriptionChunkSeconds,
       liveSeconds: config.transcriptionLiveSeconds,
       captureChunkSeconds: archiveCaptureChunkSeconds(config),
+      recordingConcurrency: config.transcriptionRecordingConcurrency,
+      xmProgressive: config.transcriptionXmProgressive,
       archiveMaxSeconds: config.transcriptionArchiveMaxSeconds
     },
     openAi: {
@@ -300,6 +341,7 @@ function publicConfig() {
       proxyEnabled: Boolean(process.env.OPENAI_PROXY_URL?.trim())
     },
     reports: publicEmailConfig(),
+    drive: publicGoogleDriveConfig(),
     database: publicDatabaseConfig(),
     scheduler: publicActionSchedulerConfig()
   };
@@ -439,6 +481,7 @@ async function initDatabase(pool) {
       channels jsonb not null,
       from_value text not null,
       to_value text not null,
+      time_zone text not null default 'Europe/Moscow',
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
@@ -448,6 +491,7 @@ async function initDatabase(pool) {
       name text not null,
       group_ids jsonb not null,
       question text not null,
+      destination text not null default 'email',
       period_mode text not null default 'daily',
       day_preset text not null default 'today',
       custom_date text not null default '',
@@ -507,6 +551,12 @@ async function initDatabase(pool) {
 
     alter table openai_actions
       add column if not exists run_on_weekends boolean not null default true;
+
+    alter table openai_actions
+      add column if not exists destination text not null default 'email';
+
+    alter table openai_groups
+      add column if not exists time_zone text not null default 'Europe/Moscow';
   `);
 
   await pool.query(
@@ -666,7 +716,7 @@ async function replaceChannelLabels(labels) {
 
 async function readOpenAiGroups() {
   const result = await dbQuery(`
-    select id, name, channels, from_value, to_value, created_at, updated_at
+    select id, name, channels, from_value, to_value, time_zone, created_at, updated_at
     from openai_groups
     order by created_at, name
   `);
@@ -676,6 +726,7 @@ async function readOpenAiGroups() {
     channels: Array.isArray(row.channels) ? row.channels : [],
     from: row.from_value,
     to: row.to_value,
+    timeZone: normalizeTimeZone(row.time_zone, 'Europe/Moscow'),
     createdAt: row.created_at?.toISOString?.() || '',
     updatedAt: row.updated_at?.toISOString?.() || ''
   }));
@@ -693,15 +744,16 @@ async function replaceOpenAiGroups(groups) {
 
     for (const group of normalized) {
       await client.query(
-        `insert into openai_groups (id, name, channels, from_value, to_value, created_at, updated_at)
-         values ($1, $2, $3::jsonb, $4, $5, coalesce($6::timestamptz, now()), now())
+        `insert into openai_groups (id, name, channels, from_value, to_value, time_zone, created_at, updated_at)
+         values ($1, $2, $3::jsonb, $4, $5, $6, coalesce($7::timestamptz, now()), now())
          on conflict (id) do update
          set name = excluded.name,
              channels = excluded.channels,
              from_value = excluded.from_value,
              to_value = excluded.to_value,
+             time_zone = excluded.time_zone,
              updated_at = now()`,
-        [group.id, group.name, JSON.stringify(group.channels), group.from, group.to, nullableTimestamp(group.createdAt)]
+        [group.id, group.name, JSON.stringify(group.channels), group.from, group.to, group.timeZone, nullableTimestamp(group.createdAt)]
       );
     }
   });
@@ -719,13 +771,14 @@ function normalizeStoredGroup(group) {
     channels,
     from,
     to,
+    timeZone: normalizeTimeZone(group.timeZone, 'Europe/Moscow'),
     createdAt: group.createdAt || ''
   };
 }
 
 async function readOpenAiActions() {
   const result = await dbQuery(`
-    select id, name, group_ids, question, period_mode, day_preset, custom_date,
+    select id, name, group_ids, question, destination, period_mode, day_preset, custom_date,
            report_daily, report_weekly, run_on_weekends, last_run, created_at, updated_at
     from openai_actions
     order by created_at, name
@@ -735,6 +788,7 @@ async function readOpenAiActions() {
     name: row.name,
     groupIds: Array.isArray(row.group_ids) ? row.group_ids : [],
     question: row.question,
+    destination: row.destination === 'drive' ? 'drive' : 'email',
     periodMode: row.period_mode,
     dayPreset: row.day_preset,
     customDate: row.custom_date,
@@ -760,13 +814,14 @@ async function replaceOpenAiActions(actions) {
 
     for (const action of normalized) {
       await client.query(
-        `insert into openai_actions (id, name, group_ids, question, period_mode, day_preset, custom_date,
+        `insert into openai_actions (id, name, group_ids, question, destination, period_mode, day_preset, custom_date,
                                      report_daily, report_weekly, run_on_weekends, last_run, created_at, updated_at)
-         values ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, coalesce($12::timestamptz, now()), now())
+         values ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, coalesce($13::timestamptz, now()), now())
          on conflict (id) do update
          set name = excluded.name,
              group_ids = excluded.group_ids,
              question = excluded.question,
+             destination = excluded.destination,
              period_mode = excluded.period_mode,
              day_preset = excluded.day_preset,
              custom_date = excluded.custom_date,
@@ -779,6 +834,7 @@ async function replaceOpenAiActions(actions) {
           action.name,
           JSON.stringify(action.groupIds),
           action.question,
+          action.destination,
           action.periodMode,
           action.dayPreset,
           action.customDate,
@@ -799,18 +855,20 @@ function normalizeStoredAction(action) {
     ? action.groupIds.map(id => String(id)).filter(Boolean)
     : [];
   const question = String(action.question || '').trim();
-  if (!action.id || !groupIds.length || !question) return null;
+  const destination = action.destination === 'drive' ? 'drive' : 'email';
+  if (!action.id || !groupIds.length || (destination === 'email' && !question)) return null;
   const periodMode = ['daily', 'weekly', 'once'].includes(action.periodMode) ? action.periodMode : 'daily';
   return {
     id: String(action.id),
     name: String(action.name || question).trim() || 'Действие',
     groupIds,
     question,
+    destination,
     periodMode,
     dayPreset: String(action.dayPreset || 'today'),
     customDate: String(action.customDate || ''),
-    reportDaily: Boolean(action.reportDaily) && periodMode !== 'once',
-    reportWeekly: Boolean(action.reportWeekly) && periodMode !== 'once',
+    reportDaily: destination === 'email' && Boolean(action.reportDaily) && periodMode !== 'once',
+    reportWeekly: destination === 'email' && Boolean(action.reportWeekly) && periodMode !== 'once',
     runOnWeekends: periodMode !== 'once' && (action.runOnWeekends === undefined ? true : Boolean(action.runOnWeekends)),
     lastRun: action.lastRun && typeof action.lastRun === 'object' ? action.lastRun : null,
     createdAt: action.createdAt || ''
@@ -865,10 +923,12 @@ async function claimManualActionRun(run) {
     const candidateState = scheduledCandidateState(modeState, runKey);
     const stateIsTerminal = candidateState?.status === 'success' || candidateState?.status === 'delivery_uncertain';
     const hasPendingAttempt = Boolean(candidateState && !stateIsTerminal);
+    const settings = await readAppSetting('ui_settings').catch(() => ({}));
     const isDueNow = scheduledActionCandidates(
       candidate.action,
       new Map(candidate.groups.map(group => [group.id, group])),
-      new Date()
+      new Date(),
+      { settings }
     ).some(item => item.runKey === runKey);
     reconcileEligible = hasPendingAttempt || (!candidateState && isDueNow);
   }
@@ -1005,6 +1065,7 @@ function startActionScheduler() {
   console.log(`OpenAI action scheduler: every ${intervalSeconds}s`);
 
   const tick = () => {
+    runDriveDeliveryTick().catch(error => console.warn(`Drive outbox: ${publicError(error)}`));
     runActionSchedulerTick().catch(error => {
       console.warn(`OpenAI action scheduler failed: ${publicError(error)}`);
     });
@@ -1014,6 +1075,123 @@ function startActionScheduler() {
 
   actionSchedulerTimer = setInterval(tick, ACTION_SCHEDULER_INTERVAL_MS);
   actionSchedulerTimer.unref?.();
+}
+
+function getDriveDeliveryOutbox() {
+  return driveDeliveryOutbox ||= createDeliveryOutbox({ directory: path.join(RUNTIME_DIR, 'drive-outbox') });
+}
+
+function driveDeliveryScope(candidate) {
+  const config = readGoogleDriveConfig();
+  return JSON.stringify([config.rootFolderId, config.clientEmail || config.clientId,
+    candidate.action.id, candidate.runKey]);
+}
+
+function durableDeliveryCandidate(candidate) {
+  const { lastRun, ...action } = candidate.action;
+  return { ...serializeScheduledCandidate(candidate), action, groups: candidate.groups || [] };
+}
+
+function deliverySettings(settings = {}) {
+  return Object.fromEntries(['displayTimeZone', 'cameraTimeZone', 'vendor', 'stream', 'audioFilter', 'transcriptSeconds']
+    .filter(key => settings[key] !== undefined).map(key => [key, settings[key]]));
+}
+
+function getDriveDeliveryWorker() {
+  if (!driveDeliveryWorker) driveDeliveryWorker = createDriveDeliveryWorker({
+    outbox: getDriveDeliveryOutbox(),
+    canDeliver: async item => {
+      if (!item.payload || item.scope !== driveDeliveryScope(item.payload.candidate)) return false;
+      const [actions, state] = await Promise.all([readOpenAiActions(), readActionSchedulerState()]);
+      const action = actions.find(value => value.id === item.actionId);
+      if (!action || action.destination !== 'drive') return false;
+      const candidate = item.payload.candidate;
+      return scheduledCandidateState(state.actions?.[action.id]?.[candidate.periodMode], item.runKey)?.status !== 'stopped';
+    },
+    deliver: async (item, signal) => {
+      assertDriveTranscriptComplete(item.payload.transcript);
+      const files = item.payload.files;
+      if (!Array.isArray(files) || files.length !== 1 || files[0].completeness !== 'complete'
+        || Number(files[0].channel) !== Number(item.channel)) {
+        throw Object.assign(new Error('Local complete TXT proof is missing'), { code: 'OUTBOX_INCOMPLETE_PAYLOAD' });
+      }
+      return getGoogleDriveClient().uploadCameraTranscripts({
+        action: item.payload.candidate.action, runKey: item.runKey, files, signal
+      });
+    }
+  });
+  return driveDeliveryWorker;
+}
+
+async function runDriveDeliveryTick() {
+  if (!ACTION_SCHEDULER_ENABLED || !databaseConfig().enabled) return;
+  await getDriveDeliveryWorker().flush();
+  const [actions, state, records] = await Promise.all([
+    readOpenAiActions(), readActionSchedulerState(), getDriveDeliveryOutbox().list()
+  ]);
+  for (const action of actions) {
+    if (action.lastRun && ['error', 'incomplete', 'delivery_pending'].includes(action.lastRun.status)) {
+      const scoped = records.filter(item => item.scope === driveDeliveryScope({ action, runKey: action.lastRun.runKey }));
+      if (scoped.length) {
+        const uploads = new Map((action.lastRun.uploads || []).map(item => [Number(item.channel), item]));
+        for (const item of scoped.filter(value => value.status === 'delivered')) uploads.set(Number(item.channel), item.upload);
+        const queuedCameras = scoped.filter(item => item.status === 'pending').length;
+        const updated = { ...action.lastRun, uploads: [...uploads.values()], queuedCameras,
+          deliveryError: scoped.find(item => item.status === 'pending' && item.lastError)?.lastError || '',
+          progress: { ...action.lastRun.progress, readyCameras: scoped.filter(item => item.payload?.files?.length).length, queuedCameras,
+            uploadedCameras: scoped.filter(item => item.status === 'delivered').length } };
+        await dbQuery('update openai_actions set last_run=$2::jsonb where id=$1 and last_run=$3::jsonb',
+          [action.id, JSON.stringify(updated), JSON.stringify(action.lastRun)]);
+      }
+    }
+    for (const mode of ['daily', 'weekly', 'once']) {
+      for (const pending of scheduledPendingStates(state.actions?.[action.id]?.[mode])) {
+        if (pending.status !== 'delivery_pending') continue;
+        const ready = records.filter(item => item.actionId === action.id && item.runKey === pending.runKey);
+        const candidate = ready.find(item => item.payload?.runCandidate)?.payload.runCandidate;
+        if (!candidate) continue;
+        const scope = driveDeliveryScope(candidate);
+        const delivered = ready.filter(item => item.scope === scope && item.status === 'delivered');
+        if (!candidate.selections.every(selection => delivered.some(item => Number(item.channel) === Number(selection.channel)))) continue;
+        // Never replace the visible status of a newer/running period with an old
+        // delivery completion, but always close that period in scheduler history.
+        const run = { ...(action.lastRun?.runKey === pending.runKey ? action.lastRun : pending),
+          status: 'success', stage: 'done', error: '', scheduled: true,
+          at: new Date().toISOString(), finishedAt: new Date().toISOString(),
+          uploads: delivered.map(item => item.upload), queuedCameras: 0, processingComplete: true, deliveryError: '',
+          progress: { ...action.lastRun?.progress, stage: 'done', percent: 100,
+            queuedCameras: 0, uploadedCameras: delivered.length,
+            readyCameras: delivered.filter(item => item.payload?.files?.length).length, deliveryError: '' } };
+        const reconciled = await mutateActionSchedulerState(latest => {
+          const current = scheduledCandidateState(latest.actions?.[action.id]?.[mode], pending.runKey);
+          if (current?.status !== 'delivery_pending') return false;
+          markActionSchedulerState(latest, candidate, run);
+        });
+        if (reconciled === false) continue;
+        await dbQuery(`update openai_actions set last_run=$2::jsonb
+          where id=$1 and last_run->>'runKey'=$3 and last_run->>'status'='delivery_pending'`,
+        [action.id, JSON.stringify(run), pending.runKey]);
+      }
+    }
+  }
+}
+
+async function boundedDriveLookup(find, candidate, context, timeoutMs = 2000) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  context.signal?.addEventListener('abort', abort, { once: true });
+  let timer;
+  try {
+    return await Promise.race([
+      find(candidate, { ...context, signal: controller.signal }),
+      new Promise((_, reject) => { timer = setTimeout(() => {
+        controller.abort(); reject(new Error('Drive lookup deferred'));
+      }, timeoutMs); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+    context.signal?.removeEventListener('abort', abort);
+  }
 }
 
 async function runActionSchedulerTick() {
@@ -1035,8 +1213,8 @@ async function runActionSchedulerTick() {
       const actionState = schedulerState.actions?.[action.id];
       const candidates = uniqueScheduledCandidates([
         ...(scheduledActionRuntime.get(action.id)?.status === 'queued' ? [scheduledActionRuntime.get(action.id).candidate] : []),
-        ...scheduledRetryCandidates(action, groupMap, actionState, now),
-        ...scheduledActionCandidates(action, groupMap, now)
+        ...scheduledActionCandidates(action, groupMap, now, { settings }),
+        ...scheduledRetryCandidates(action, groupMap, actionState, now, { settings })
       ]);
       for (const candidate of candidates) {
         const queued = scheduledActionRuntime.get(action.id);
@@ -1062,6 +1240,7 @@ async function runActionSchedulerTick() {
           lastRun = await runScheduledOpenAiAction(candidate, {
             settings,
             labels,
+            previousState: candidateState,
             signal: runtime.controller.signal,
             runtime
           });
@@ -1103,27 +1282,32 @@ async function triggerScheduledOpenAiAction(payload) {
     throw httpError(409, 'Действие уже выполняется вручную.');
   }
 
-  const [actions, groups, schedulerState] = await Promise.all([
+  const [actions, groups, schedulerState, settings] = await Promise.all([
     readOpenAiActions(),
     readOpenAiGroups(),
-    readActionSchedulerState()
+    readActionSchedulerState(),
+    readAppSetting('ui_settings').catch(() => ({}))
   ]);
   const action = actions.find(item => item.id === actionId);
   if (!action) throw httpError(404, 'Действие не найдено.');
-  if (action.periodMode === 'once') {
+  if (action.periodMode === 'once' && action.destination !== 'drive') {
     throw httpError(409, 'Одноразовые действия запускаются в открытой странице.');
   }
 
   const groupMap = new Map(groups.map(group => [group.id, group]));
   const actionState = schedulerState.actions?.[action.id];
   const now = new Date();
+  const actionGroups = (action.groupIds || []).map(groupId => groupMap.get(groupId)).filter(Boolean);
+  const stoppedCandidate = restoreExplicitStoppedCandidate(action, actionGroups, settings);
   const candidates = uniqueScheduledCandidates([
-    ...scheduledRetryCandidates(action, groupMap, actionState, now, { ignoreMaxAge: true }),
-    ...scheduledActionCandidates(action, groupMap, now)
+    ...(action.periodMode === 'once' ? [oneTimeDriveCandidate(action, actionGroups, settings, now)] : []),
+    ...(stoppedCandidate ? [stoppedCandidate] : []),
+    ...scheduledRetryCandidates(action, groupMap, actionState, now, { ignoreMaxAge: true, settings }),
+    ...scheduledActionCandidates(action, groupMap, now, { settings })
   ]);
   const preferredRunKey = String(action.lastRun?.runKey || '');
   const runnableCandidates = candidates.filter(item => {
-      if (action.lastRun?.status !== 'stopped' && actionLastRunMatchesCandidate(action.lastRun, item)) return false;
+      if (!['stopped', 'incomplete'].includes(action.lastRun?.status) && actionLastRunMatchesCandidate(action.lastRun, item)) return false;
       const modeState = actionState?.[item.periodMode];
       const itemState = scheduledCandidateState(modeState, item.runKey, item);
       return !itemState || (itemState.status !== 'success' && itemState.status !== 'delivery_uncertain');
@@ -1136,6 +1320,17 @@ async function triggerScheduledOpenAiAction(payload) {
     || runnableCandidates[0];
   if (!candidate) {
     throw httpError(409, 'Сейчас нет завершённого периода или ошибки, которую можно запустить повторно.');
+  }
+
+  const candidateState = scheduledCandidateState(actionState?.[candidate.periodMode], candidate.runKey, candidate);
+  if (candidateState?.status === 'delivery_pending') {
+    const outbox = getDriveDeliveryOutbox();
+    for (const item of await outbox.list(driveDeliveryScope(candidate))) {
+      if (item.status === 'pending') await outbox.retryNow(item.id);
+    }
+    runDriveDeliveryTick().catch(error => console.warn(`Drive delivery retry: ${publicError(error)}`));
+    return { status: 'delivery_pending', runKey: candidate.runKey,
+      message: 'Повтор отправки поставлен в очередь. Повторная транскрибация не требуется.' };
   }
 
   // Reserve before awaiting storage so simultaneous clicks cannot queue two runs.
@@ -1166,25 +1361,66 @@ async function triggerScheduledOpenAiAction(payload) {
 function forceScheduledCandidateRetry(state, candidate, now = new Date()) {
   const actionState = state.actions?.[candidate.action.id];
   const modeState = actionState?.[candidate.periodMode];
-  if (!modeState || typeof modeState !== 'object' || scheduledCandidateState(modeState, candidate.runKey)?.status === 'stopped') {
+  if (!modeState || typeof modeState !== 'object' || ['stopped', 'incomplete'].includes(scheduledCandidateState(modeState, candidate.runKey)?.status)) {
     markActionSchedulerState(state, candidate, { status: 'queued', at: now.toISOString() }, now);
     const next = state.actions[candidate.action.id][candidate.periodMode];
     next.nextRetryAt = now.toISOString();
-    next.pending.forEach(item => { if (item.runKey === candidate.runKey) item.nextRetryAt = now.toISOString(); });
+    next.firstAttemptAt = now.toISOString();
+    next.attempts = 0;
+    next.availabilityAttempts = 0;
+    next.availabilityFingerprint = '';
+    next.incompleteAudioAttempts = 0;
+    next.incompleteAudioFingerprint = '';
+    next.incompleteAudioCheckpoint = null;
+    next.noProgressAttempts = 0;
+    next.noProgressCheckpoint = null;
+    next.pending.forEach(item => { if (item.runKey === candidate.runKey) Object.assign(item, {
+      nextRetryAt: now.toISOString(), firstAttemptAt: now.toISOString(), attempts: 0,
+      availabilityAttempts: 0, availabilityFingerprint: '',
+      incompleteAudioAttempts: 0, incompleteAudioFingerprint: '', incompleteAudioCheckpoint: null,
+      noProgressAttempts: 0, noProgressCheckpoint: null
+    }); });
     return;
   }
   const retryAt = now.toISOString();
   const pending = scheduledPendingStates(modeState).map(item => item.runKey === candidate.runKey
-    ? { ...item, attempts: 0, firstAttemptAt: retryAt, nextRetryAt: retryAt }
+    ? { ...item, attempts: 0, availabilityAttempts: 0, availabilityFingerprint: '',
+      incompleteAudioAttempts: 0, incompleteAudioFingerprint: '', incompleteAudioCheckpoint: null,
+      noProgressAttempts: 0, noProgressCheckpoint: null,
+      firstAttemptAt: retryAt, nextRetryAt: retryAt }
     : item);
   const nextModeState = modeState.runKey === candidate.runKey
-    ? { ...modeState, attempts: 0, firstAttemptAt: retryAt, nextRetryAt: retryAt, pending }
+    ? { ...modeState, attempts: 0, availabilityAttempts: 0, availabilityFingerprint: '',
+      incompleteAudioAttempts: 0, incompleteAudioFingerprint: '', incompleteAudioCheckpoint: null,
+      noProgressAttempts: 0, noProgressCheckpoint: null,
+      firstAttemptAt: retryAt, nextRetryAt: retryAt, pending }
     : { ...modeState, pending };
   state.actions = state.actions && typeof state.actions === 'object' ? state.actions : {};
   state.actions[candidate.action.id] = {
     ...(actionState || {}),
     [candidate.periodMode]: nextModeState
   };
+}
+
+function oneTimeDriveCandidate(action, groups, settings = {}, now = new Date()) {
+  const selections = groups.flatMap(group => {
+    const zone = normalizeTimeZone(group.timeZone, configuredDisplayTimeZone(settings));
+    const fromMs = zonedDateTimeToEpochMs(group.from, zone);
+    const toMs = zonedDateTimeToEpochMs(group.to, zone);
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs || toMs > now.getTime()) {
+      throw httpError(400, 'Для одноразового действия выберите завершённый период группы.');
+    }
+    return (group.channels || []).map(channel => ({ groupId: group.id, groupName: group.name,
+      channel: Number(channel), from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(),
+      rangeSeconds: (toMs - fromMs) / 1000 }));
+  });
+  if (!selections.length) throw httpError(400, 'Для действия не выбраны камеры.');
+  const from = earliestLocalDateTime(selections.map(item => item.from));
+  const to = latestLocalDateTime(selections.map(item => item.to));
+  const configHash = scheduledActionConfigHash(action, groups, 'once');
+  return { action, groups, selections, from, to, dueAt: now.toISOString(), periodMode: 'once',
+    runKey: `once:${from}:${to}:${configHash}`, configHash,
+    timeZone: configuredDisplayTimeZone(settings), cameraTimeZone: configuredCameraTimeZone(settings) };
 }
 
 async function stopScheduledOpenAiAction(payload, services = {}) {
@@ -1221,6 +1457,7 @@ function assertScheduledActionsEditable(actions, runtimes = scheduledActionRunti
 
 async function readPublicActionSchedulerState(actions = [], groups = []) {
   const state = await readActionSchedulerState().catch(() => ({ actions: {} }));
+  const settings = await readAppSetting('ui_settings').catch(() => ({}));
   const enabled = ACTION_SCHEDULER_ENABLED && databaseConfig().enabled;
   const now = new Date();
   const groupMap = new Map(groups.map(group => [group.id, group]));
@@ -1228,12 +1465,12 @@ async function readPublicActionSchedulerState(actions = [], groups = []) {
     enabled,
     running: actionSchedulerRunning,
     serverNow: now.toISOString(),
-    timeZone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
+    timeZone: configuredDisplayTimeZone(settings),
     intervalSeconds: Math.round(ACTION_SCHEDULER_INTERVAL_MS / 1000),
     actions: state.actions || {},
     schedules: Object.fromEntries(actions.map(action => {
       const runtime = scheduledActionRuntime.get(action.id);
-      const next = enabled && !runtime ? nextScheduledActionRun(action, groupMap, state.actions?.[action.id], now) : null;
+      const next = enabled && !runtime ? nextScheduledActionRun(action, groupMap, state.actions?.[action.id], now, settings) : null;
       return [action.id, {
         state: runtime?.status || (next && Date.parse(next.nextRunAt) <= now.getTime() ? 'waiting' : 'idle'),
         nextRunAt: next?.nextRunAt || '',
@@ -1244,7 +1481,7 @@ async function readPublicActionSchedulerState(actions = [], groups = []) {
   };
 }
 
-function nextScheduledActionRun(action, groupMap, actionState, now = new Date()) {
+function nextScheduledActionRun(action, groupMap, actionState, now = new Date(), settings = {}) {
   if (action.periodMode === 'once') return null;
   const upcoming = [];
   const consider = (candidate, earliest) => {
@@ -1254,12 +1491,14 @@ function nextScheduledActionRun(action, groupMap, actionState, now = new Date())
     if (!shouldRunScheduledCandidate(state, candidate, new Date(at))) return;
     upcoming.push({ nextRunAt: new Date(at).toISOString(), periodMode: candidate.periodMode, runKey: candidate.runKey });
   };
-  for (const candidate of scheduledRetryCandidates(action, groupMap, actionState, now)) consider(candidate, now.getTime());
+  for (const candidate of scheduledRetryCandidates(action, groupMap, actionState, now, { settings })) consider(candidate, now.getTime());
   for (let day = 0; day <= 14; day += 1) {
-    const probe = day === 0 ? now : new Date(`${offsetDatePart(toDateInputLocal(now), day)}T00:00:00`);
-    for (const candidate of scheduledActionCandidates(action, groupMap, probe, { includeFuture: true })) {
+    const displayTimeZone = configuredDisplayTimeZone(settings);
+    const probeDate = offsetZonedDatePart(zonedDatePart(now, displayTimeZone), day);
+    const probe = day === 0 ? now : new Date(zonedDateTimeToEpochMs(`${probeDate}T00:00:00`, displayTimeZone));
+    for (const candidate of scheduledActionCandidates(action, groupMap, probe, { includeFuture: true, settings })) {
       const at = Math.max(now.getTime(), probe.getTime(), Date.parse(candidate.dueAt));
-      if (scheduledActionCandidates(action, groupMap, new Date(at)).some(item => item.runKey === candidate.runKey)) consider(candidate, at);
+      if (scheduledActionCandidates(action, groupMap, new Date(at), { settings }).some(item => item.runKey === candidate.runKey)) consider(candidate, at);
     }
   }
   return upcoming.sort((left, right) => Date.parse(left.nextRunAt) - Date.parse(right.nextRunAt))[0] || null;
@@ -1321,6 +1560,13 @@ function markActionSchedulerState(state, candidate, lastRun, now = new Date()) {
     error: lastRun?.error || '',
     stage: lastRun?.stage || '',
     attempts,
+    availabilityAttempts: lastRun?.availabilityAttempts ?? (sameRun && status !== 'success' ? previous.availabilityAttempts || 0 : 0),
+    availabilityFingerprint: lastRun?.availabilityFingerprint ?? (sameRun && status !== 'success' ? previous.availabilityFingerprint || '' : ''),
+    incompleteAudioAttempts: lastRun?.incompleteAudioAttempts ?? (sameRun && status !== 'success' ? previous.incompleteAudioAttempts || 0 : 0),
+    incompleteAudioFingerprint: lastRun?.incompleteAudioFingerprint ?? (sameRun && status !== 'success' ? previous.incompleteAudioFingerprint || '' : ''),
+    incompleteAudioCheckpoint: lastRun?.incompleteAudioCheckpoint ?? (sameRun && status !== 'success' ? previous.incompleteAudioCheckpoint || null : null),
+    noProgressAttempts: lastRun?.noProgressAttempts ?? (sameRun && status !== 'success' ? previous.noProgressAttempts || 0 : 0),
+    noProgressCheckpoint: lastRun?.noProgressCheckpoint ?? (sameRun && status !== 'success' ? previous.noProgressCheckpoint || null : null),
     firstAttemptAt: sameRun && previous.firstAttemptAt
       ? previous.firstAttemptAt
       : (lastRun?.startedAt || lastRun?.at || now.toISOString()),
@@ -1392,7 +1638,7 @@ function scheduledCandidateState(modeState, runKey, candidate = null) {
 }
 
 function isTerminalScheduledStatus(status) {
-  return ['success', 'delivery_uncertain', 'stopped'].includes(status);
+  return ['success', 'delivery_uncertain', 'stopped', 'incomplete'].includes(status);
 }
 
 function actionLastRunMatchesCandidate(lastRun, candidate) {
@@ -1423,6 +1669,7 @@ function scheduledCompletedStates(modeState) {
 
 function shouldRunScheduledCandidate(actionState, candidate, now = new Date()) {
   if (!actionState || actionState.runKey !== candidate.runKey) return true;
+  if (actionState.status === 'delivery_pending') return false;
   if (isTerminalScheduledStatus(actionState.status)) return false;
 
   const firstAttemptAtMs = Date.parse(actionState.firstAttemptAt || actionState.at || '');
@@ -1450,6 +1697,8 @@ function serializeScheduledCandidate(candidate) {
     dueAt: candidate.dueAt,
     runKey: candidate.runKey,
     configHash: candidate.configHash,
+    timeZone: candidate.timeZone,
+    cameraTimeZone: candidate.cameraTimeZone,
     selections: (candidate.selections || []).map(selection => ({ ...selection }))
   };
 }
@@ -1478,7 +1727,7 @@ function scheduledRetryCandidates(action, groupMap, actionState, now = new Date(
           ? legacyConfigHash
           : '';
       if (!matchingConfigHash) return null;
-      const snapshot = restoreScheduledCandidateSnapshot(action, groups, state, periodMode, matchingConfigHash);
+      const snapshot = restoreScheduledCandidateSnapshot(action, groups, state, periodMode, matchingConfigHash, options.settings);
       if (!snapshot || snapshot.runKey !== state.runKey || snapshot.configHash !== matchingConfigHash) return null;
 
       const selections = Array.isArray(snapshot.selections)
@@ -1495,13 +1744,34 @@ function scheduledRetryCandidates(action, groupMap, actionState, now = new Date(
         to: snapshot.to,
         dueAt: snapshot.dueAt,
         runKey: snapshot.runKey,
-        configHash: matchingConfigHash
+        configHash: matchingConfigHash,
+        timeZone: snapshot.timeZone || configuredDisplayTimeZone(options.settings),
+        cameraTimeZone: snapshot.cameraTimeZone || configuredCameraTimeZone(options.settings)
       };
     }).filter(Boolean);
   });
 }
 
-function restoreScheduledCandidateSnapshot(action, groups, state, periodMode, configHash) {
+function restoreExplicitStoppedCandidate(action, groups, settings = {}) {
+  const lastRun = action?.lastRun;
+  if (!['stopped', 'incomplete'].includes(lastRun?.status) || !lastRun.runKey) return null;
+  const periodMode = lastRun.details?.period?.mode
+    || (action.periodMode === 'weekly' ? 'weekly' : 'daily');
+  const currentConfigHash = scheduledActionConfigHash(action, groups, periodMode);
+  const legacyConfigHash = scheduledActionConfigHash(action, groups, periodMode, { legacy: true });
+  const storedConfigHash = String(lastRun.runKey).slice(String(lastRun.runKey).lastIndexOf(':') + 1);
+  const configHash = storedConfigHash === currentConfigHash
+    ? currentConfigHash
+    : storedConfigHash === legacyConfigHash
+      ? legacyConfigHash
+      : '';
+  if (!configHash) return null;
+  const snapshot = restoreScheduledCandidateSnapshot(action, groups, lastRun, periodMode, configHash, settings);
+  if (!snapshot || snapshot.runKey !== lastRun.runKey) return null;
+  return { action, groups, ...snapshot, configHash };
+}
+
+function restoreScheduledCandidateSnapshot(action, groups, state, periodMode, configHash, settings = {}) {
   if (state.candidate && typeof state.candidate === 'object') {
     return state.candidate;
   }
@@ -1516,7 +1786,7 @@ function restoreScheduledCandidateSnapshot(action, groups, state, periodMode, co
     customDate: datePart,
     runOnWeekends: true
   };
-  const selections = resolveScheduledActionSelections(retryAction, groups, new Date(), periodMode);
+  const selections = resolveScheduledActionSelections(retryAction, groups, new Date(), periodMode, settings);
   const from = earliestLocalDateTime(selections.map(selection => selection.from));
   const to = latestLocalDateTime(selections.map(selection => selection.to));
   if (!selections.length || from !== state.from || to !== state.to) return null;
@@ -1528,6 +1798,8 @@ function restoreScheduledCandidateSnapshot(action, groups, state, periodMode, co
     dueAt: state.dueAt || state.at || new Date().toISOString(),
     runKey: state.runKey,
     configHash,
+    timeZone: configuredDisplayTimeZone(settings),
+    cameraTimeZone: configuredCameraTimeZone(settings),
     selections
   };
 }
@@ -1561,21 +1833,24 @@ function scheduledActionCandidate(action, groupMap, now, periodMode = action?.pe
   const groups = (action.groupIds || []).map(groupId => groupMap.get(groupId)).filter(Boolean);
   if (!groups.length) return null;
 
-  const selections = resolveScheduledActionSelections(action, groups, now, periodMode);
+  const settings = options.settings || {};
+  const displayTimeZone = configuredDisplayTimeZone(settings);
+  const selections = resolveScheduledActionSelections(action, groups, now, periodMode, settings);
   if (!selections.length) return null;
 
   const from = earliestLocalDateTime(selections.map(selection => selection.from));
   const to = latestLocalDateTime(selections.map(selection => selection.to));
   if (!from || !to) return null;
 
-  let dueAtMs = localDateTimeMs(to);
+  let dueAtMs = Date.parse(to);
+  if (!Number.isFinite(dueAtMs)) dueAtMs = zonedDateTimeToEpochMs(to, displayTimeZone);
   if (!Number.isFinite(dueAtMs)) return null;
 
   if (periodMode === 'weekly') {
-    const weekStart = resolveScheduledWeeklyDates(action, now)[0];
+    const weekStart = resolveScheduledWeeklyDates(action, now, settings)[0];
     const friday = offsetDatePart(weekStart, 4);
-    const fridayEveningMs = localDateTimeMs(`${friday}T18:00`);
-    const saturdayEndMs = localDateTimeMs(`${offsetDatePart(friday, 1)}T23:59:59`);
+    const fridayEveningMs = zonedDateTimeToEpochMs(`${friday}T18:00`, displayTimeZone);
+    const saturdayEndMs = zonedDateTimeToEpochMs(`${offsetDatePart(friday, 1)}T23:59:59`, displayTimeZone);
     dueAtMs = Math.max(dueAtMs, fridayEveningMs);
     if ((!options.includeFuture && now.getTime() < dueAtMs) || now.getTime() > saturdayEndMs) return null;
   } else if (!options.includeFuture && now.getTime() < dueAtMs) {
@@ -1593,7 +1868,9 @@ function scheduledActionCandidate(action, groupMap, now, periodMode = action?.pe
     to,
     dueAt: new Date(dueAtMs).toISOString(),
     runKey: `${periodMode}:${from}:${to}:${configHash}`,
-    configHash
+    configHash,
+    timeZone: displayTimeZone,
+    cameraTimeZone: configuredCameraTimeZone(settings)
   };
 }
 
@@ -1612,20 +1889,24 @@ function scheduledActionConfigHash(action, groups, periodMode, options = {}) {
       name: group.name,
       channels: group.channels,
       from: group.from,
-      to: group.to
+      to: group.to,
+      ...(!options.legacy ? { timeZone: group.timeZone || 'Europe/Moscow' } : {})
     }))
   };
-  if (!options.legacy && periodMode === 'daily') config.runOnWeekends = Boolean(action.runOnWeekends);
+  if (!options.legacy) {
+    config.destination = action.destination === 'drive' ? 'drive' : 'email';
+    if (periodMode === 'daily') config.runOnWeekends = Boolean(action.runOnWeekends);
+  }
   return crypto.createHash('sha1')
     .update(JSON.stringify(config))
     .digest('hex');
 }
 
-function resolveScheduledActionSelections(action, groups, now = new Date(), periodMode = action?.periodMode) {
+function resolveScheduledActionSelections(action, groups, now = new Date(), periodMode = action?.periodMode, settings = {}) {
   const selections = [];
 
   for (const group of groups) {
-    const ranges = resolveScheduledGroupRanges(action, group, now, periodMode);
+    const ranges = resolveScheduledGroupRanges(action, group, now, periodMode, settings);
     for (const range of ranges) {
       for (const channel of group.channels || []) {
         selections.push({
@@ -1643,37 +1924,55 @@ function resolveScheduledActionSelections(action, groups, now = new Date(), peri
   return selections.filter(selection => selection.rangeSeconds > 0);
 }
 
-function resolveScheduledGroupRanges(action, group, now = new Date(), periodMode = action?.periodMode) {
+function resolveScheduledGroupRanges(action, group, now = new Date(), periodMode = action?.periodMode, settings = {}) {
   const dates = periodMode === 'weekly'
-    ? resolveScheduledWeeklyDates(action, now)
-    : [resolveScheduledDailyDate(action, now)];
+    ? resolveScheduledWeeklyDates(action, now, settings)
+    : [resolveScheduledDailyDate(action, now, settings)];
 
   return dates.filter(date => periodMode !== 'daily' || action.runOnWeekends || !isWeekendDatePart(date)).map(date => {
-    const from = combineDateAndTime(date, timeOnly(group.from));
-    let to = combineDateAndTime(date, timeOnly(group.to));
-    if (secondsBetween(from, to) <= 0) {
-      to = combineDateAndTime(offsetDatePart(date, 1), timeOnly(group.to));
+    const legacyNaiveTime = !group.timeZone && !settings?.displayTimeZone && !settings?.cameraTimeZone
+      && !process.env.DISPLAY_TIME_ZONE && !process.env.CAMERA_TIME_ZONE;
+    if (legacyNaiveTime) {
+      const from = combineDateAndTime(date, timeOnly(group.from));
+      let to = combineDateAndTime(date, timeOnly(group.to));
+      if (secondsBetween(from, to) <= 0) {
+        to = combineDateAndTime(offsetDatePart(date, 1), timeOnly(group.to));
+      }
+      return secondsBetween(from, to) > 0 ? { from, to } : null;
     }
+    const groupTimeZone = normalizeTimeZone(group.timeZone, 'Europe/Moscow');
+    const displayTimeZone = configuredDisplayTimeZone(settings);
+    const anchor = '2000-01-15';
+    const fromDisplay = convertLocalDateTime(`${anchor}T${timeOnly(group.from)}`, groupTimeZone, displayTimeZone);
+    const sourceToDate = timeOnly(group.to) <= timeOnly(group.from) ? offsetDatePart(anchor, 1) : anchor;
+    const toDisplay = convertLocalDateTime(`${sourceToDate}T${timeOnly(group.to)}`, groupTimeZone, displayTimeZone);
+    const fromLocal = combineDateAndTime(date, timeOnly(fromDisplay));
+    let toLocal = combineDateAndTime(date, timeOnly(toDisplay));
+    if (toDisplay.slice(0, 10) !== fromDisplay.slice(0, 10) || timeOnly(toDisplay) <= timeOnly(fromDisplay)) {
+      toLocal = combineDateAndTime(offsetDatePart(date, 1), timeOnly(toDisplay));
+    }
+    const from = new Date(zonedDateTimeToEpochMs(fromLocal, displayTimeZone)).toISOString();
+    const to = new Date(zonedDateTimeToEpochMs(toLocal, displayTimeZone)).toISOString();
     return secondsBetween(from, to) > 0 ? { from, to } : null;
   }).filter(Boolean);
 }
 
-function resolveScheduledDailyDate(action, now = new Date()) {
+function resolveScheduledDailyDate(action, now = new Date(), settings = {}) {
   if (action.dayPreset === 'custom' && action.customDate) return action.customDate;
   const offset = {
     yesterday: -1,
     today: 0,
     tomorrow: 1
   }[action.dayPreset] ?? 0;
-  let date = offsetDatePart(toDateInputLocal(now), offset);
+  let date = offsetDatePart(zonedDatePart(now, configuredDisplayTimeZone(settings)), offset);
   if (action.dayPreset === 'yesterday' && !action.runOnWeekends) {
     while (isWeekendDatePart(date)) date = offsetDatePart(date, -1);
   }
   return date;
 }
 
-function resolveScheduledWeeklyDates(action, now = new Date()) {
-  const start = startOfWeekDatePart(resolveScheduledDailyDate(action, now));
+function resolveScheduledWeeklyDates(action, now = new Date(), settings = {}) {
+  const start = startOfWeekDatePart(resolveScheduledDailyDate(action, now, settings));
   return Array.from({ length: 5 }, (_, index) => offsetDatePart(start, index));
 }
 
@@ -1690,15 +1989,33 @@ async function runScheduledOpenAiAction(candidate, context) {
   const requestApi = services.requestApi || localJsonApi;
   const startedAt = new Date();
   const reportTypes = scheduledReportTypes(candidate);
+  const destination = candidate.action.destination === 'drive' ? 'drive' : 'email';
+  // Injected services get an isolated store unless a durable one is explicitly
+  // supplied. Diagnostics/tests must never populate the production outbox.
+  const outbox = destination === 'drive' ? services.deliveryOutbox
+    || (Object.keys(services).length ? createMemoryDeliveryOutbox() : getDriveDeliveryOutbox()) : null;
+  const deliveryScope = destination === 'drive' ? driveDeliveryScope(candidate) : '';
+  const deliveryWorker = destination === 'drive' ? (Object.keys(services).length
+    ? createDriveDeliveryWorker({ outbox, timeoutMs: services.deliveryTimeoutMs || 30000,
+      now: services.deliveryNow || (() => Date.now()),
+      deliver: (item, deliverySignal) => (services.uploadDriveTranscripts || uploadScheduledDriveTranscripts)(
+        item.payload.candidate, item.payload.transcript,
+        { settings: item.payload.settings, labels: item.payload.labels, signal: deliverySignal }) })
+    : getDriveDeliveryWorker()) : null;
+  let deliveryTask = Promise.resolve();
+  const restoredCameras = new Map();
   let answerData = null;
   let reportData = null;
+  let driveData = destination === 'drive' ? { ok: true, uploads: [] } : null;
   const transcriptResult = {
-    contextLines: [], warnings: [], issues: [], knownRecordings: 0,
-    completedRecordings: 0, failedSearches: 0, failedRecordings: 0
+    contextLines: [], transcriptEntries: [], warnings: [], issues: [], knownRecordings: 0,
+    completedRecordings: 0, failedSearches: 0, failedRecordings: 0,
+    missingAudioRecordings: 0
   };
   let stage = 'search';
   const progress = {
     stage, completedChunks: 0, transcribedSeconds: 0, completedRecordings: 0, knownRecordings: 0,
+    uploadedCameras: 0, partialUploadedCameras: 0, readyCameras: 0, queuedCameras: 0,
     totalSelections: candidate.selections.length, completedSelections: 0,
     selectionTotalSeconds: 0, selectionProcessedSeconds: 0, percent: 0
   };
@@ -1720,16 +2037,152 @@ async function runScheduledOpenAiAction(candidate, context) {
     Object.assign(progress, update);
     stage = progress.stage;
     progress.percent = Math.max(progress.percent, scheduledProgressPercent(progress));
-    if (context.runtime) context.runtime.lastRun = { ...runningState, stage, progress: { ...progress } };
+    const snapshot = {
+      ...runningState, stage, progress: { ...progress },
+      uploads: driveData?.uploads || [], diagnostics: transcriptResult.diagnostics || []
+    };
+    if (context.runtime) context.runtime.lastRun = snapshot;
     await (services.updateLastRun || updateOpenAiActionLastRun)(candidate.action.id, {
-      ...runningState, stage, progress: { ...progress }
+      ...snapshot
     }).catch(error => {
       console.warn(`OpenAI action scheduler could not save running status: ${publicError(error)}`);
     });
   };
+  const mergeDriveUploads = uploadData => {
+    const uploads = new Map((driveData?.uploads || []).map(item => [Number(item.channel), item]));
+    for (const item of uploadData?.uploads || []) uploads.set(Number(item.channel), item);
+    driveData = {
+      ...(driveData || {}),
+      ...(uploadData || {}),
+      uploads: [...uploads.values()].sort((left, right) => Number(left.channel) - Number(right.channel))
+    };
+  };
+  const refreshDelivery = async () => {
+    if (!outbox) return [];
+    const records = await outbox.list(deliveryScope);
+    mergeDriveUploads({ uploads: records.filter(item => item.status === 'delivered').map(item => item.upload) });
+    progress.queuedCameras = records.filter(item => item.status === 'pending').length;
+    progress.readyCameras = records.filter(item => item.payload?.files?.length).length;
+    progress.uploadedCameras = records.filter(item => item.status === 'delivered').length;
+    progress.deliveryError = records.find(item => item.status === 'pending' && item.lastError)?.lastError || '';
+    return records;
+  };
+  const kickDelivery = () => {
+    deliveryTask = deliveryWorker.flush().catch(error => {
+      console.warn(`Drive outbox delivery deferred: ${publicError(error)}`);
+    });
+  };
+  const settleDelivery = async () => {
+    if (!outbox) return;
+    kickDelivery();
+    let timer;
+    await Promise.race([deliveryTask, new Promise(resolve => { timer = setTimeout(resolve, 250); })]);
+    clearTimeout(timer);
+    await refreshDelivery();
+  };
+  const uploadCompletedDriveCamera = async camera => {
+    if (destination !== 'drive') return;
+    const channel = Number(camera.channel);
+    const diagnostics = (transcriptResult.diagnostics || []).filter(item => Number(item.channel) === channel);
+    // Known incomplete audio stays solely in the block cache. It must never
+    // become a deliverable TXT, even when most of the camera was processed.
+    if (camera.issues.length || restoredCameras.has(channel)) return;
+    const selections = candidate.selections.filter(selection => Number(selection.channel) === channel);
+    const cameraCandidate = { ...candidate, selections };
+    const cameraTranscript = {
+      ...transcriptResult,
+      contextLines: transcriptResult.contextLines.filter(line => String(line).includes(`| ${camera.label} |`)),
+      transcriptEntries: transcriptResult.transcriptEntries.filter(entry => Number(entry.channel) === channel),
+      warnings: camera.warnings,
+      issues: camera.issues,
+      diagnostics,
+      knownRecordings: diagnostics.reduce((sum, item) => sum + (Number(item.recordings) || 0), 0),
+      completedRecordings: diagnostics.reduce((sum, item) => sum + (Number(item.completedRecordings) || 0), 0),
+      failedSearches: camera.issues.filter(issue => issue.code === 'SEARCH_FAILED').length,
+      failedRecordings: camera.issues.filter(issue => issue.stage === 'transcript').length
+    };
+    assertDriveTranscriptComplete(cameraTranscript);
+    if (!diagnostics.length || diagnostics.some(item => item.status !== 'complete')) {
+      throw httpError(502, 'Нет подтверждения полной обработки камеры.', { stage: 'transcript', channel });
+    }
+    const files = buildDriveTranscriptFiles({ action: cameraCandidate.action, from: candidate.from, to: candidate.to,
+      selections: selections.map(selection => ({ ...selection, label: channelLabelFromRows(context.labels, channel) })),
+      entries: cameraTranscript.transcriptEntries, issues: [], diagnostics, settings: context.settings });
+    // Save the exact, complete input before any network delivery. This includes
+    // silence intervals in diagnostics even when ASR returned no words.
+    await outbox.enqueue({ scope: deliveryScope, actionId: candidate.action.id,
+      runKey: candidate.runKey, channel, payload: {
+        candidate: durableDeliveryCandidate(cameraCandidate), runCandidate: durableDeliveryCandidate(candidate),
+        transcript: cameraTranscript, files, settings: deliverySettings(context.settings), labels: context.labels || []
+      } });
+    kickDelivery();
+    await refreshDelivery();
+    await onProgress({
+      stage: 'transcript',
+      uploadedCameras: driveData.uploads.filter(item => item.completeness !== 'partial').length,
+      readyCameras: progress.readyCameras, queuedCameras: progress.queuedCameras,
+      lastReadyChannel: channel, lastReadyLabel: camera.label
+    });
+  };
   try {
     await onProgress({ stage: 'search' });
-    await buildScheduledActionTranscript(candidate, { ...context, requestApi, result: transcriptResult, progress, onProgress });
+    const skipChannels = new Set();
+    if (destination === 'drive') {
+      let records = await refreshDelivery();
+      const hasAllLocal = candidate.selections.every(selection => records.some(item => Number(item.channel) === Number(selection.channel)));
+      if (!hasAllLocal) try {
+        const findDriveTranscripts = services.findDriveTranscripts
+          || (services.uploadDriveTranscripts ? async () => ({ ok: true, uploads: [] }) : findScheduledDriveTranscripts);
+        const existing = await boundedDriveLookup(findDriveTranscripts, candidate, {
+          ...context,
+          settings: context.settings,
+          labels: context.labels,
+          signal
+        }, services.driveLookupTimeoutMs || 2000);
+        for (const item of existing?.uploads || []) {
+          if (item.completeness === 'partial' || !item.fileId) continue;
+          await outbox.rememberDelivered({ scope: deliveryScope, actionId: candidate.action.id,
+            runKey: candidate.runKey, channel: Number(item.channel), upload: { ...item, completeness: 'complete' } });
+        }
+      } catch (error) {
+        signal?.throwIfAborted();
+        transcriptResult.warnings.push('Проверка Google Диска отложена. Обработка продолжается; готовые TXT сохраняются локально.');
+      }
+      records = await refreshDelivery();
+      progress.processedCoverage = [];
+      for (const item of records) {
+        const channel = Number(item.channel);
+        skipChannels.add(channel);
+        restoredCameras.set(channel, item);
+        for (const selection of candidate.selections.filter(value => Number(value.channel) === channel)) {
+          progress.processedCoverage.push({ channel, from: selection.from, to: selection.to,
+            processedSeconds: selection.rangeSeconds || secondsBetween(selection.from, selection.to) });
+        }
+      }
+      if (records.length) {
+        kickDelivery();
+        await onProgress({
+          stage: 'search',
+          uploadedCameras: driveData.uploads.length,
+          readyCameras: progress.readyCameras, queuedCameras: progress.queuedCameras, skippedCameras: skipChannels.size
+        });
+      }
+    }
+    await buildScheduledActionTranscript(candidate, {
+      ...context,
+      requestApi,
+      result: transcriptResult,
+      progress,
+      onProgress,
+      onCameraComplete: uploadCompletedDriveCamera,
+      skipChannels, restoredCameras
+    });
+    if (destination === 'drive') {
+      assertDriveTranscriptComplete(transcriptResult);
+      await onProgress({ stage: 'drive' });
+      await settleDelivery();
+      answerData = { answer: '', model: '', responseId: '' };
+    } else {
     await onProgress({ stage: 'ask' });
     answerData = await requestApi('/api/openai/ask', {
       signal,
@@ -1749,7 +2202,8 @@ async function runScheduledOpenAiAction(candidate, context) {
           name: group.name,
           channels: group.channels,
           from: group.from,
-          to: group.to
+          to: group.to,
+          timeZone: group.timeZone
         })),
         channels: candidate.selections.map(selection => ({
           channel: selection.channel,
@@ -1770,6 +2224,7 @@ async function runScheduledOpenAiAction(candidate, context) {
           reportTypes,
           deliveryKey: `${candidate.action.id}:${candidate.runKey}`,
           generatedAt: new Date().toISOString(),
+          timeZone: configuredDisplayTimeZone(context.settings),
           from: candidate.from,
           to: candidate.to,
           question: candidate.action.question,
@@ -1792,7 +2247,8 @@ async function runScheduledOpenAiAction(candidate, context) {
             name: group.name,
             channels: group.channels,
             from: group.from,
-            to: group.to
+            to: group.to,
+            timeZone: group.timeZone
           })),
           channels: candidate.selections.map(selection => ({
             channel: selection.channel,
@@ -1804,10 +2260,15 @@ async function runScheduledOpenAiAction(candidate, context) {
         }
       });
     }
+    }
 
     signal?.throwIfAborted();
     const lastRun = {
-      status: 'success',
+      status: destination === 'drive' && progress.queuedCameras ? 'delivery_pending' : 'success',
+      stage: destination === 'drive' && progress.queuedCameras ? 'drive' : 'done',
+      processingComplete: true,
+      queuedCameras: progress.queuedCameras || 0,
+      deliveryError: progress.deliveryError || '',
       scheduled: true,
       at: new Date().toISOString(),
       startedAt: startedAt.toISOString(),
@@ -1821,12 +2282,16 @@ async function runScheduledOpenAiAction(candidate, context) {
       transcriptLines: transcriptResult.contextLines.length,
       selections: candidate.selections.length,
       recordings: transcriptResult.knownRecordings,
+      missingAudioRecordings: transcriptResult.missingAudioRecordings || 0,
       reports: reportData?.sent || [],
-      progress: { ...progress, stage: 'done', percent: 100 },
+      uploads: driveData?.uploads || [],
+      progress: { ...progress, stage: destination === 'drive' && progress.queuedCameras ? 'drive' : 'done',
+        percent: destination === 'drive' && progress.queuedCameras ? 97 : 100 },
       warnings: transcriptResult.warnings,
+      diagnostics: transcriptResult.diagnostics || [],
       runKey: candidate.runKey
     };
-    if (transcriptResult.issues.length) {
+    if (transcriptResult.issues.length && destination === 'email') {
       lastRun.errorNotification = await (services.notifyError || sendScheduledActionErrorEmail)(candidate, {
         ...lastRun,
         error: 'Часть записей не обработана. Ответ сформирован по доступному тексту.',
@@ -1838,6 +2303,8 @@ async function runScheduledOpenAiAction(candidate, context) {
     try {
       await (services.persistRun || persistScheduledActionRun)(candidate, lastRun, {
         reportTypes,
+        destination,
+        uploads: driveData?.uploads || [],
         warnings: transcriptResult.warnings
       });
     } catch (error) {
@@ -1847,24 +2314,244 @@ async function runScheduledOpenAiAction(candidate, context) {
     console.log(`OpenAI action scheduler: finished "${candidate.action.name}"`);
     return lastRun;
   } catch (error) {
+    await settleDelivery().catch(() => {});
     return persistScheduledActionFailure(candidate, error, {
       startedAt,
       stage,
       answerData,
       transcriptResult,
       reportData,
+      driveData,
       progress,
+      previousState: context.previousState,
       signal,
       services
     });
   }
 }
 
+function scheduledAvailabilityRetry(candidate, error, previousState = {}, now = new Date()) {
+  const issues = error?.details?.issues || [];
+  const availabilityCodes = new Set(['NO_RECORDINGS', 'ARCHIVE_UNCONFIRMED', 'ARCHIVE_GAPS']);
+  if (error?.details?.failedSearches || error?.details?.failedRecordings
+    || !issues.length || !issues.every(issue => availabilityCodes.has(issue.code))) {
+    return {
+      attempts: previousState?.runKey === candidate.runKey ? Number(previousState.availabilityAttempts) || 0 : 0,
+      fingerprint: previousState?.runKey === candidate.runKey ? previousState.availabilityFingerprint || '' : '',
+      exhausted: false
+    };
+  }
+  const fingerprint = crypto.createHash('sha1').update(JSON.stringify(issues.map(issue => ({
+    channel: issue.channel, code: issue.code, from: issue.from, to: issue.to, gaps: issue.gaps
+  })).sort((a, b) => Number(a.channel) - Number(b.channel)))).digest('hex');
+  const attempts = previousState?.runKey === candidate.runKey && previousState.availabilityFingerprint === fingerprint
+    ? (Number(previousState.availabilityAttempts) || 0) + 1 : 1;
+  const endMs = safeInstantMs(candidate.to, candidate.timeZone || 'Europe/Moscow');
+  // Allow fresh archives time to be indexed. Old unavailable periods require
+  // attention, not unlimited retries; a manual retry explicitly resets this.
+  return { attempts, fingerprint, exhausted: attempts >= 3 && Number.isFinite(endMs) && now.getTime() - endMs > 86400000 };
+}
+
+function scheduledIncompleteAudioRetry(candidate, error, previousState = {}, progress = {}) {
+  // A delivery/network failure is not an observation that the archive/audio
+  // recovered. Keep this independent history without counting another check.
+  const reset = () => ({
+    attempts: previousState?.runKey === candidate.runKey ? Number(previousState.incompleteAudioAttempts) || 0 : 0,
+    fingerprint: previousState?.runKey === candidate.runKey ? previousState.incompleteAudioFingerprint || '' : '',
+    checkpoint: previousState?.runKey === candidate.runKey ? previousState.incompleteAudioCheckpoint || null : null,
+    exhausted: false
+  });
+  const issues = error?.details?.issues;
+  if (!Array.isArray(issues) || !issues.length || error?.details?.failedSearches
+    || Number(error?.details?.failedRecordings || 0) > issues.length) return reset();
+
+  const wrapperCodes = new Set(['INCOMPLETE_AUDIO', 'TRANSCRIPTION_FAILED', 'TRANSCRIPT_FAILED']);
+  const transientMessage = /timed?\s*out|timeout|socket|network|CUDA|cuDNN|cuBLAS|out of memory|GigaAM|тайм.?аут|время ожидания|сетев/iu;
+  const gaps = [];
+  for (const issue of issues) {
+    const nodes = [];
+    const seen = new Set();
+    const visit = node => {
+      if (!node || typeof node !== 'object' || seen.has(node) || nodes.length >= 16) return;
+      seen.add(node);
+      nodes.push(node);
+      visit(node.cause);
+      visit(node.details);
+    };
+    visit(issue);
+    const incomplete = nodes.find(node => node.code === 'INCOMPLETE_AUDIO');
+    if (!incomplete || nodes.some(node => (
+      (node.code && !wrapperCodes.has(node.code))
+      || [408, 429, 504].includes(Number(node.statusCode || node.status))
+      || transientMessage.test(String(node.error || node.message || ''))
+    ))) return reset();
+
+    const sources = [incomplete, ...nodes];
+    const number = key => {
+      const value = sources.find(node => typeof node[key] === 'number' && Number.isFinite(node[key]))?.[key];
+      return value >= 0 ? value : null;
+    };
+    const timestamp = key => {
+      const value = sources.find(node => typeof node[key] === 'string' && node[key])?.[key];
+      const parsed = value ? safeInstantMs(value, candidate.cameraTimeZone || 'Europe/Moscow') : NaN;
+      return Number.isFinite(parsed) ? parsed / 1000 : null;
+    };
+    const channel = Number(issue.channel);
+    const fileName = String(issue.fileName || '').trim();
+    const gap = {
+      channel, fileName,
+      offsetSeconds: number('offsetSeconds'),
+      expectedSeconds: number('expectedDurationSeconds') ?? number('durationSeconds'),
+      receivedSeconds: number('receivedDurationSeconds'),
+      endOffsetSeconds: number('endOffsetSeconds'),
+      missingFrom: timestamp('missingFrom'),
+      missingTo: timestamp('missingTo')
+    };
+    if (!(channel > 0) || !fileName || (gap.offsetSeconds === null && gap.missingFrom === null)
+      || (gap.expectedSeconds === null && gap.endOffsetSeconds === null && gap.missingTo === null)) return reset();
+    gaps.push(gap);
+  }
+  gaps.sort((left, right) => left.channel - right.channel
+    || left.fileName.localeCompare(right.fileName)
+    || (left.offsetSeconds ?? left.missingFrom) - (right.offsetSeconds ?? right.missingFrom));
+  const count = key => Math.max(0, Number(progress?.[key]) || 0);
+  const checkpoint = {
+    gaps,
+    progress: {
+      completedChunks: count('completedChunks'),
+      completedRecordings: count('completedRecordings'),
+      uploadedCameras: count('uploadedCameras'),
+      transcribedSeconds: count('transcribedSeconds')
+    }
+  };
+  const previous = previousState?.incompleteAudioCheckpoint;
+  const closeNumber = (left, right) => left === right
+    || (Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= 0.25);
+  const sameGaps = Array.isArray(previous?.gaps) && previous.gaps.length === gaps.length
+    && gaps.every((gap, index) => {
+      const prior = previous.gaps[index];
+      return prior && prior.channel === gap.channel && prior.fileName === gap.fileName
+        && ['offsetSeconds', 'expectedSeconds', 'receivedSeconds', 'endOffsetSeconds', 'missingFrom', 'missingTo']
+          .every(key => closeNumber(prior[key], gap[key]));
+    });
+  const progressed = !previous?.progress || Object.entries(checkpoint.progress).some(([key, value]) => (
+    value > Number(previous.progress[key] || 0) + (key === 'transcribedSeconds' ? 0.25 : 0)
+  ));
+  const sameFailure = previousState?.runKey === candidate.runKey
+    && previousState.incompleteAudioFingerprint && sameGaps && !progressed;
+  // Compare all retries to the first observation in the streak. This tolerates
+  // timing jitter without hiding cumulative progress made in small increments.
+  const retainedCheckpoint = sameFailure ? previous : checkpoint;
+  const fingerprint = sameFailure ? previousState.incompleteAudioFingerprint
+    : crypto.createHash('sha1').update(JSON.stringify(checkpoint)).digest('hex');
+  const attempts = sameFailure ? (Number(previousState.incompleteAudioAttempts) || 0) + 1 : 1;
+  return { attempts, fingerprint, checkpoint: retainedCheckpoint, exhausted: attempts >= 3 };
+}
+
+function scheduledProcessingNoProgressRetry(candidate, error, previousState = {}, progress = {}, diagnostics = [], now = new Date()) {
+  const sameRun = previousState?.runKey === candidate.runKey;
+  const retained = {
+    attempts: sameRun ? Math.max(0, Number(previousState.noProgressAttempts) || 0) : 0,
+    checkpoint: sameRun ? previousState.noProgressCheckpoint || null : null,
+    exhausted: false,
+    observed: false
+  };
+  const issues = error?.details?.issues;
+  const archiveCodes = new Set(['NO_RECORDINGS', 'ARCHIVE_UNCONFIRMED', 'ARCHIVE_GAPS']);
+  if (!Array.isArray(issues) || !issues.length || error?.details?.failedSearches
+    || Number(error?.details?.failedRecordings || 0) > issues.length
+    || ['drive', 'report', 'ask'].includes(error?.details?.stage)) return retained;
+
+  let hasArchive = false;
+  const receivedAudio = new Map();
+  for (const issue of issues) {
+    if (archiveCodes.has(issue?.code)) {
+      hasArchive = true;
+      continue;
+    }
+    // Only a fully classified shortfall is a substantive processing attempt.
+    // In particular, a timeout/connection failure is never source absence.
+    const audio = scheduledIncompleteAudioRetry(candidate, { details: { issues: [issue] } });
+    if (!audio.attempts) return retained;
+    for (const gap of audio.checkpoint.gaps) {
+      const key = JSON.stringify([gap.channel, gap.fileName, gap.offsetSeconds, gap.expectedSeconds, gap.endOffsetSeconds]);
+      if (Number.isFinite(gap.receivedSeconds)) receivedAudio.set(key, gap.receivedSeconds);
+    }
+  }
+
+  const coverage = new Map();
+  const includeCoverage = item => {
+    const channel = Number(item?.channel);
+    const from = safeInstantMs(item?.from, candidate.timeZone || 'Europe/Moscow');
+    const to = safeInstantMs(item?.to, candidate.timeZone || 'Europe/Moscow');
+    if (!(channel > 0) || !Number.isFinite(from) || !(to > from)) return;
+    const key = JSON.stringify([channel, from, to]);
+    const value = Math.min((to - from) / 1000, Math.max(0, Number(item.processedSeconds) || 0));
+    coverage.set(key, Math.max(coverage.get(key) || 0, value));
+  };
+  // These are actual decoded/processed durations, not attempted selections,
+  // cache hits, upload counts or the amount of recognized speech. The caller
+  // includes complete local/remote cameras skipped in the current attempt.
+  for (const item of diagnostics || []) includeCoverage(item);
+  for (const item of progress?.processedCoverage || []) includeCoverage(item);
+  const checkpoint = {
+    version: 1,
+    coverage: Object.fromEntries([...coverage].sort(([a], [b]) => a.localeCompare(b))),
+    receivedAudio: Object.fromEntries([...receivedAudio].sort(([a], [b]) => a.localeCompare(b))),
+    transcribedSeconds: coverage.size ? 0 : Math.max(0, Number(progress?.transcribedSeconds) || 0),
+    hasArchive
+  };
+  const prior = retained.checkpoint?.version === 1 ? retained.checkpoint : null;
+  const progressed = prior && (
+    Object.entries(checkpoint.coverage).some(([key, value]) => value > Number(prior.coverage?.[key] || 0) + 0.25)
+    || Object.entries(checkpoint.receivedAudio).some(([key, value]) => (
+      // A different failure location is not itself progress. Complete decoded
+      // blocks are measured above; only compare the same partial block here.
+      Object.hasOwn(prior.receivedAudio || {}, key) && value > Number(prior.receivedAudio[key] || 0) + 0.25
+    ))
+    || checkpoint.transcribedSeconds > Number(prior.transcribedSeconds || 0) + 0.25
+  );
+  const attempts = !prior || progressed ? 1 : retained.attempts + 1;
+  const mergeMaximum = (previous, current) => {
+    const merged = { ...(previous || {}) };
+    for (const [key, value] of Object.entries(current || {})) merged[key] = Math.max(Number(merged[key]) || 0, value);
+    return merged;
+  };
+  // Preserve a high-water mark: disappearing cache/search results, a larger gap
+  // or a different error code cannot reset the no-progress streak. Keep the
+  // initial observation when there is only sub-tolerance timing jitter.
+  const nextCheckpoint = !prior ? checkpoint : {
+    version: 1,
+    coverage: progressed ? mergeMaximum(prior.coverage, checkpoint.coverage) : { ...prior.coverage },
+    receivedAudio: progressed ? mergeMaximum(prior.receivedAudio, checkpoint.receivedAudio) : {
+      ...checkpoint.receivedAudio, ...prior.receivedAudio
+    },
+    transcribedSeconds: progressed ? Math.max(prior.transcribedSeconds || 0, checkpoint.transcribedSeconds) : prior.transcribedSeconds || 0,
+    hasArchive: prior.hasArchive || hasArchive
+  };
+  const endMs = safeInstantMs(candidate.to, candidate.timeZone || 'Europe/Moscow');
+  const archiveGraceElapsed = !nextCheckpoint.hasArchive
+    || (Number.isFinite(endMs) && now.getTime() - endMs > 86400000);
+  return { attempts, checkpoint: nextCheckpoint, exhausted: attempts >= 3 && archiveGraceElapsed, observed: true };
+}
+
 async function persistScheduledActionFailure(candidate, error, context = {}) {
   const stopped = Boolean(context.signal?.aborted);
   const deliveryUncertain = Boolean(error?.deliveryUncertain || error?.details?.deliveryUncertain);
+  const availability = scheduledAvailabilityRetry(candidate, error, context.previousState);
+  const incompleteAudio = scheduledIncompleteAudioRetry(candidate, error, context.previousState, context.progress);
+  const noProgress = scheduledProcessingNoProgressRetry(candidate, error, context.previousState,
+    context.progress, context.transcriptResult?.diagnostics);
   const lastRun = {
-    status: stopped ? 'stopped' : deliveryUncertain ? 'delivery_uncertain' : 'error',
+    status: stopped ? 'stopped' : deliveryUncertain ? 'delivery_uncertain'
+      : noProgress.exhausted ? 'incomplete' : 'error',
+    availabilityAttempts: availability.attempts,
+    availabilityFingerprint: availability.fingerprint,
+    incompleteAudioAttempts: incompleteAudio.attempts,
+    incompleteAudioFingerprint: incompleteAudio.fingerprint,
+    incompleteAudioCheckpoint: incompleteAudio.checkpoint,
+    noProgressAttempts: noProgress.attempts,
+    noProgressCheckpoint: noProgress.checkpoint,
     scheduled: true,
     at: new Date().toISOString(),
     startedAt: context.startedAt?.toISOString?.() || new Date().toISOString(),
@@ -1872,7 +2559,8 @@ async function persistScheduledActionFailure(candidate, error, context = {}) {
     from: candidate.from,
     to: candidate.to,
     dueAt: candidate.dueAt,
-    error: stopped ? '' : publicError(error),
+    error: stopped ? '' : publicError(error) + (noProgress.exhausted
+      ? ' Автоповторы этого периода прекращены после 3 проверок без прогресса. Период требует внимания. Кэш и готовые файлы сохранены; неполные камеры не выгружены. Доступен ручной повтор.' : ''),
     stage: error?.details?.stage || context.stage || 'scheduler',
     model: context.answerData?.model || '',
     responseId: context.answerData?.responseId || '',
@@ -1880,13 +2568,18 @@ async function persistScheduledActionFailure(candidate, error, context = {}) {
     transcriptLines: context.transcriptResult?.contextLines?.length || 0,
     selections: candidate.selections?.length || 0,
     recordings: context.transcriptResult?.knownRecordings || 0,
+    missingAudioRecordings: context.transcriptResult?.missingAudioRecordings || 0,
     reports: context.reportData?.sent || [],
+    uploads: context.driveData?.uploads || [],
     runKey: candidate.runKey,
     details: error.details,
-    progress: context.progress ? { ...context.progress } : undefined,
+    diagnostics: context.transcriptResult?.diagnostics || [],
+    progress: context.progress ? { ...context.progress, stage: error?.details?.stage || context.stage } : undefined,
     warnings: context.transcriptResult?.warnings || []
   };
-  if (!stopped) lastRun.errorNotification = await (context.services?.notifyError || sendScheduledActionErrorEmail)(candidate, lastRun);
+  if (!stopped && candidate.action.destination !== 'drive') {
+    lastRun.errorNotification = await (context.services?.notifyError || sendScheduledActionErrorEmail)(candidate, lastRun);
+  }
   if (context.signal?.aborted) {
     lastRun.status = 'stopped';
     lastRun.error = '';
@@ -1902,6 +2595,7 @@ async function persistScheduledActionFailure(candidate, error, context = {}) {
 
 function scheduledProgressPercent(progress) {
   if (progress.stage === 'done') return 100;
+  if (progress.stage === 'drive') return 97;
   if (progress.stage === 'report') return 97;
   if (progress.stage === 'ask') return 90;
   const fraction = progress.selectionTotalSeconds > 0
@@ -1929,6 +2623,7 @@ async function persistScheduledActionRun(candidate, lastRun, extraDetails = {}) 
         periodMode: candidate.action.periodMode,
         dayPreset: candidate.action.dayPreset,
         customDate: candidate.action.customDate,
+        destination: candidate.action.destination,
         reportDaily: candidate.action.reportDaily,
         reportWeekly: candidate.action.reportWeekly,
         runOnWeekends: candidate.action.runOnWeekends
@@ -1946,49 +2641,129 @@ async function persistScheduledActionRun(candidate, lastRun, extraDetails = {}) 
 
 async function buildScheduledActionTranscript(candidate, context) {
   const result = context.result || {
-    contextLines: [], warnings: [], issues: [], knownRecordings: 0,
-    completedRecordings: 0, failedSearches: 0, failedRecordings: 0
+    contextLines: [], transcriptEntries: [], warnings: [], issues: [], knownRecordings: 0,
+    completedRecordings: 0, failedSearches: 0, failedRecordings: 0,
+    missingAudioRecordings: 0
   };
-  const { contextLines, warnings, issues } = result;
+  result.transcriptEntries ||= [];
+  result.diagnostics ||= [];
+  result.missingAudioRecordings ||= 0;
+  const { contextLines, transcriptEntries, warnings, issues } = result;
   const requestApi = context.requestApi || localJsonApi;
   const progress = context.progress || {};
-  const finishSelection = () => context.onProgress?.({
-    completedSelections: (progress.completedSelections || 0) + 1,
-    selectionProcessedSeconds: 0, selectionTotalSeconds: 0
-  });
+  const remainingSelections = new Map();
+  const cameraOutcomes = new Map();
+  for (const selection of candidate.selections) {
+    const channel = Number(selection.channel);
+    remainingSelections.set(channel, (remainingSelections.get(channel) || 0) + 1);
+  }
+  let selectionDiagnostic;
+  const finishSelection = async (selection, warningStart, issueStart) => {
+    if (selectionDiagnostic) {
+      selectionDiagnostic.elapsedMs = Date.now() - selectionDiagnostic.startedAtMs;
+      delete selectionDiagnostic.startedAtMs;
+      selectionDiagnostic.issues = issues.slice(issueStart);
+      if (selectionDiagnostic.status !== 'skipped') {
+        selectionDiagnostic.status = selectionDiagnostic.issues.length ? 'incomplete' : 'complete';
+      }
+    }
+    await context.onProgress?.({
+      completedSelections: (progress.completedSelections || 0) + 1,
+      selectionProcessedSeconds: 0,
+      selectionTotalSeconds: 0
+    });
+    const channel = Number(selection.channel);
+    const outcome = cameraOutcomes.get(channel) || { warnings: [], issues: [] };
+    outcome.warnings.push(...warnings.slice(warningStart));
+    outcome.issues.push(...issues.slice(issueStart));
+    cameraOutcomes.set(channel, outcome);
+    const remaining = Math.max(0, (remainingSelections.get(channel) || 1) - 1);
+    remainingSelections.set(channel, remaining);
+    if (!remaining) {
+      await context.onCameraComplete?.({
+        channel,
+        label: channelLabelFromRows(context.labels, channel),
+        warnings: outcome.warnings,
+        issues: outcome.issues,
+        result
+      });
+    }
+  };
 
   for (const selection of candidate.selections) {
     context.signal?.throwIfAborted();
+    const warningStart = warnings.length;
+    const issueStart = issues.length;
     const label = `${selection.groupName} · ${channelLabelFromRows(context.labels, selection.channel)}`;
+    selectionDiagnostic = {
+      channel: Number(selection.channel), label, from: selection.from, to: selection.to,
+      status: 'search', startedAtMs: Date.now(), searchMs: 0, processingMs: 0,
+      recordings: 0, completedRecordings: 0, cachedChunks: 0, processedSeconds: 0, captureMs: 0, asrMs: 0
+    };
+    result.diagnostics.push(selectionDiagnostic);
     await context.onProgress?.({
       stage: 'search', channel: selection.channel, label,
       from: selection.from, to: selection.to, fileName: '', selectionProcessedSeconds: 0, selectionTotalSeconds: 0
     });
+    if (context.skipChannels?.has(Number(selection.channel))) {
+      selectionDiagnostic.status = 'skipped';
+      await finishSelection(selection, warningStart, issueStart);
+      continue;
+    }
     const query = new URLSearchParams(scheduledCameraParams(context.settings, selection.channel));
-    query.set('from', selection.from);
-    query.set('to', selection.to);
+    const cameraRange = selectionCameraRange(selection, context.settings);
+    query.set('from', cameraRange.from);
+    query.set('to', cameraRange.to);
     query.set('_', Date.now());
 
     const searchPath = `/api/recordings/search?${query}`;
     let searchData;
+    const searchStartedAt = Date.now();
     try {
-      searchData = await requestApi(searchPath, { signal: context.signal });
+      searchData = await searchScheduledRecordings(requestApi, searchPath, { signal: context.signal });
     } catch (error) {
       context.signal?.throwIfAborted();
       result.failedSearches += 1;
       warnings.push(`${label}: поиск записей: ${publicError(error)}`);
-      if (issues.length < 100) issues.push({
+      issues.push({
         stage: 'search', label, channel: selection.channel, from: selection.from, to: selection.to,
-        error: publicError(error), status: error.statusCode, details: error.details
+        code: 'SEARCH_FAILED', error: publicError(error), status: error.statusCode, details: error.details
       });
-      await finishSelection();
+      selectionDiagnostic.searchMs = Date.now() - searchStartedAt;
+      await finishSelection(selection, warningStart, issueStart);
       continue;
     }
+    selectionDiagnostic.searchMs = Date.now() - searchStartedAt;
+    selectionDiagnostic.searchOutcome = searchData.searchOutcome || (searchData.items?.length ? 'found' : 'empty');
     if (searchData.warning) warnings.push(`${label}: ${searchData.warning}`);
 
     const items = (searchData.items || [])
-      .map(item => ({ item, coverage: recordingCoverageForRange(item, selection.from, selection.to) }))
+      .map(item => ({ item, coverage: recordingCoverageForRange(item, cameraRange.from, cameraRange.to, configuredCameraTimeZone(context.settings)) }))
       .filter(entry => entry.coverage && entry.coverage.durationSeconds > 0);
+
+    const coverage = assessIntervalCoverage({
+      from: new Date(zonedDateTimeToEpochMs(selection.from, configuredDisplayTimeZone(context.settings))).toISOString(),
+      to: new Date(zonedDateTimeToEpochMs(selection.to, configuredDisplayTimeZone(context.settings))).toISOString(),
+      intervals: items.map(entry => ({
+        from: new Date(absoluteSegmentEpochMs(entry.item.startTime || cameraRange.from, entry.coverage.offsetSeconds, configuredCameraTimeZone(context.settings))).toISOString(),
+        to: new Date(absoluteSegmentEpochMs(entry.item.startTime || cameraRange.from, entry.coverage.offsetSeconds + entry.coverage.durationSeconds, configuredCameraTimeZone(context.settings))).toISOString()
+      }))
+    });
+    selectionDiagnostic.archiveCoverage = coverage;
+    selectionDiagnostic.recordings = items.length;
+    const unconfirmed = searchData.searchComplete === false || searchData.searchOutcome === 'unconfirmed';
+    if (!items.length || unconfirmed || !coverage.complete) {
+      const code = unconfirmed ? 'ARCHIVE_UNCONFIRMED' : !items.length ? 'NO_RECORDINGS' : 'ARCHIVE_GAPS';
+      const reason = unconfirmed ? 'Регистратор не подтвердил доступность полного архива (Ret=119).'
+        : !items.length ? 'Регистратор не вернул записи за выбранный период.'
+        : `Архив не покрывает весь период: отсутствует ${Math.round(coverage.missingSeconds)} с.`;
+      warnings.push(`${label}: ${reason}`);
+      issues.push({
+        stage: 'search', code, label, channel: selection.channel,
+        from: selection.from, to: selection.to, error: reason,
+        gaps: coverage.gaps, details: searchData.details
+      });
+    }
 
     result.knownRecordings += items.length;
     await context.onProgress?.({
@@ -1996,50 +2771,120 @@ async function buildScheduledActionTranscript(candidate, context) {
       selectionTotalSeconds: items.reduce((sum, entry) => sum + entry.coverage.durationSeconds, 0)
     });
     if (!items.length) {
-      warnings.push(`${label}: записи не найдены`);
-      await finishSelection();
+      await finishSelection(selection, warningStart, issueStart);
       continue;
     }
 
-    for (const entry of items) {
-      context.signal?.throwIfAborted();
-      const processedBefore = progress.selectionProcessedSeconds || 0;
-      try {
-        await transcribeScheduledRecording({
-          item: entry.item,
-          coverage: entry.coverage,
-          selection,
-          settings: context.settings,
-          labels: context.labels,
-          vendor: searchData.vendor || '',
-          contextLines,
-          requestApi,
-          progress,
-          signal: context.signal,
-          onProgress: context.onProgress
-        });
-        result.completedRecordings += 1;
-        await context.onProgress?.({ completedRecordings: result.completedRecordings });
-      } catch (error) {
-        context.signal?.throwIfAborted();
-        result.failedRecordings += 1;
-        const recording = entry.item.fileName || entry.item.startTime || 'архивный фрагмент';
-        warnings.push(`${label}: ${recording}: ${publicError(error)}`);
-        if (issues.length < 100) issues.push({
-          stage: 'transcript', label, channel: selection.channel,
-          fileName: recording, error: publicError(error), status: error.statusCode,
-          ...error.details
-        });
+    const baseCompletedChunks = progress.completedChunks || 0;
+    const processingStartedAt = Date.now();
+    selectionDiagnostic.status = 'transcript';
+    const baseTranscribedSeconds = progress.transcribedSeconds || 0;
+    const recordingProgress = items.map(() => ({
+      completedChunks: 0,
+      transcribedSeconds: 0,
+      selectionProcessedSeconds: 0
+    }));
+    const recordingContextLines = items.map(() => []);
+    const recordingTranscriptEntries = items.map(() => []);
+    let progressQueue = Promise.resolve();
+    const publishRecordingProgress = (index, update = {}) => {
+      if (update.recordingCapture) {
+        selectionDiagnostic.captures ||= [];
+        selectionDiagnostic.captures[index] = update.recordingCapture;
       }
-      await context.onProgress?.({ selectionProcessedSeconds: processedBefore + entry.coverage.durationSeconds });
+      if (update.transcriptTiming?.cached) selectionDiagnostic.cachedChunks += 1;
+      else if (update.transcriptTiming) {
+        selectionDiagnostic.captureMs += Number(update.transcriptTiming.captureMs) || 0;
+        selectionDiagnostic.asrMs += Number(update.transcriptTiming.asrMs) || 0;
+      }
+      const state = recordingProgress[index];
+      for (const key of ['completedChunks', 'transcribedSeconds', 'selectionProcessedSeconds']) {
+        if (Number.isFinite(Number(update[key]))) state[key] = Number(update[key]);
+      }
+      const aggregate = key => recordingProgress.reduce((sum, item) => sum + (Number(item[key]) || 0), 0);
+      const globalUpdate = {
+        ...update,
+        completedChunks: baseCompletedChunks + aggregate('completedChunks'),
+        transcribedSeconds: baseTranscribedSeconds + aggregate('transcribedSeconds'),
+        selectionProcessedSeconds: aggregate('selectionProcessedSeconds')
+      };
+      progressQueue = progressQueue.then(() => context.onProgress?.(globalUpdate));
+      return progressQueue;
+    };
+
+    let recordingResults = [];
+    try {
+      recordingResults = await mapWithConcurrency(
+        items,
+        cameraConfig().transcriptionRecordingConcurrency,
+        async (entry, index) => {
+          context.signal?.throwIfAborted();
+          const localProgress = {};
+          let failure = null;
+          try {
+            await transcribeScheduledRecording({
+              item: entry.item,
+              coverage: entry.coverage,
+              selection,
+              settings: context.settings,
+              labels: context.labels,
+              vendor: searchData.vendor || '',
+              contextLines: recordingContextLines[index],
+              transcriptEntries: recordingTranscriptEntries[index],
+              requestApi,
+              progress: localProgress,
+              signal: context.signal,
+              onProgress: update => {
+                Object.assign(localProgress, update);
+                return publishRecordingProgress(index, update);
+              }
+            });
+            result.completedRecordings += 1;
+            selectionDiagnostic.completedRecordings += 1;
+            await publishRecordingProgress(index, { completedRecordings: result.completedRecordings });
+          } catch (error) {
+            context.signal?.throwIfAborted();
+            failure = error;
+          } finally {
+            await publishRecordingProgress(index, {
+              selectionProcessedSeconds: entry.coverage.durationSeconds
+            });
+          }
+          return { entry, failure, index };
+        }
+      );
+      // EOF or a timeout without audio proves only that capture failed. It
+      // cannot establish silence or an audio gap in the source recording.
+      result.failedRecordings += recordingResults.filter(item => item.failure).length;
+      await progressQueue;
+    } finally {
+      selectionDiagnostic.processingMs = Date.now() - processingStartedAt;
+      selectionDiagnostic.processedSeconds = recordingProgress.reduce((sum, item) => sum + item.transcribedSeconds, 0);
+      for (const lines of recordingContextLines) contextLines.push(...lines);
+      for (const entries of recordingTranscriptEntries) transcriptEntries.push(...entries);
     }
-    await finishSelection();
+
+    for (const recordingResult of recordingResults) {
+      if (!recordingResult.failure) continue;
+      const recording = recordingResult.entry.item.fileName
+        || recordingResult.entry.item.startTime
+        || 'архивный фрагмент';
+      warnings.push(`${label}: ${recording}: ${publicError(recordingResult.failure)}`);
+      issues.push({
+        stage: 'transcript', code: 'TRANSCRIPTION_FAILED', label, channel: selection.channel,
+        fileName: recording, error: publicError(recordingResult.failure), status: recordingResult.failure.statusCode,
+        ...recordingResult.failure.details
+      });
+    }
+    await finishSelection(selection, warningStart, issueStart);
   }
 
   if (!result.completedRecordings && !contextLines.length && (result.failedSearches || result.failedRecordings)) {
+    const firstIssue = issues.find(issue => issue.error);
+    const cause = firstIssue ? ` Причина (${firstIssue.label}): ${firstIssue.error}` : '';
     throw httpError(
       502,
-      `Не удалось получить пригодный транскрипт: ошибок поиска ${result.failedSearches}, ошибок записей ${result.failedRecordings}.`,
+      `Не удалось получить пригодный транскрипт: ошибок поиска ${result.failedSearches}, ошибок записей ${result.failedRecordings}.${cause}`,
       {
         stage: result.failedRecordings ? 'transcript' : 'search',
         failedSearches: result.failedSearches,
@@ -2053,7 +2898,170 @@ async function buildScheduledActionTranscript(candidate, context) {
   return result;
 }
 
+async function searchScheduledRecordings(requestApi, searchPath, options = {}) {
+  const { signal } = options;
+  const wait = options.delay || (ms => waitFor(ms, undefined, { signal }));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    signal?.throwIfAborted();
+    try {
+      return await requestApi(searchPath, { signal });
+    } catch (error) {
+      signal?.throwIfAborted();
+      const status = Number(error.statusCode || 0);
+      const code = error.code || error.details?.code || error.cause?.code;
+      const transient = [408, 502, 503, 504].includes(status)
+        || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN', 'EPIPE'].includes(code)
+        || ((!status || status === 500) && /Request timed out|socket hang up/i.test(error.message || ''));
+      if (attempt === 1 || !transient || (status >= 400 && status < 500 && status !== 408)) throw error;
+      await wait(1000);
+    }
+  }
+}
+
+function assertDriveTranscriptComplete(result = {}) {
+  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+  const failedSearches = Number(result.failedSearches || 0);
+  const failedRecordings = Number(result.failedRecordings || 0);
+  const issues = [...(Array.isArray(result.issues) ? result.issues : [])];
+  const addIncomplete = (item, reason) => issues.push({
+    stage: 'transcript', code: 'INCOMPLETE_TRANSCRIPT', channel: item?.channel,
+    from: item?.from || item?.start, to: item?.to || item?.end,
+    error: reason
+  });
+  if (result.partial === true || result.completeness === 'partial' || result.complete === false) {
+    addIncomplete(result, 'Полнота транскрибации не подтверждена.');
+  }
+  for (const diagnostic of Array.isArray(result.diagnostics) ? result.diagnostics : []) {
+    const hasCameraIssue = () => issues.some(issue => !issue?.channel || Number(issue.channel) === Number(diagnostic.channel));
+    if (!hasCameraIssue() && Array.isArray(diagnostic.issues)) issues.push(...diagnostic.issues);
+    if (!hasCameraIssue() && (diagnostic.partial === true || diagnostic.completeness === 'partial'
+      || diagnostic.archiveCoverage?.complete === false
+      || (diagnostic.status && !['complete', 'skipped'].includes(diagnostic.status)))) {
+      addIncomplete(diagnostic, 'Полнота обработки камеры или покрытия архива не подтверждена.');
+    }
+  }
+  for (const entry of result.transcriptEntries || result.entries || []) {
+    // Legacy audio_gap entries were generated from failed captures. They are
+    // not proof of silence and must never become a complete Drive report.
+    if (entry?.kind === 'audio_gap' || entry?.type === 'audio_gap' || entry?.audioGap === true
+      || entry?.partial === true || entry?.completeness === 'partial') {
+      addIncomplete(entry, 'Пропуск аудио не подтверждён как корректно обработанная тишина.');
+    }
+  }
+  if (!issues.length && !failedSearches && !failedRecordings) return;
+  const first = issues[0];
+  const channels = [...new Set(issues.map(issue => issue.channel).filter(Boolean))].join(', ');
+  throw httpError(502, `Период обработан не полностью${channels ? `; камеры: ${channels}` : ''}. ${first?.error || 'Не все записи обработаны.'} Доступные результаты сохранены локально; неполные камеры не выгружены.`, {
+    stage: first?.stage || (failedSearches ? 'search' : 'transcript'),
+    failedSearches,
+    failedRecordings,
+    warnings: warnings.slice(-100),
+    issues
+  });
+}
+
+function configuredCameraTimeZone(settings = {}) {
+  return normalizeTimeZone(settings?.cameraTimeZone || process.env.CAMERA_TIME_ZONE, 'Europe/Moscow');
+}
+
+function configuredDisplayTimeZone(settings = {}) {
+  return normalizeTimeZone(
+    settings?.displayTimeZone || process.env.DISPLAY_TIME_ZONE || process.env.TZ,
+    'Asia/Yekaterinburg'
+  );
+}
+
+function normalizeRecordingSearchTimeRange(searchParams) {
+  const params = new URLSearchParams(searchParams);
+  const requestedFrom = String(params.get('from') || '').trim();
+  const requestedTo = String(params.get('to') || '').trim();
+  const sourceTimeZone = normalizeTimeZone(params.get('timeZone') || '', configuredDisplayTimeZone());
+  const targetTimeZone = normalizeTimeZone(params.get('cameraTimeZone') || '', configuredCameraTimeZone());
+  let cameraFrom = requestedFrom;
+  let cameraTo = requestedTo;
+  const hasExplicitZone = value => /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(value);
+  try {
+    if (requestedFrom && (params.has('timeZone') || hasExplicitZone(requestedFrom))) {
+      cameraFrom = localDateTimeInZone(zonedDateTimeToEpochMs(requestedFrom, sourceTimeZone), targetTimeZone, { seconds: false });
+    }
+    if (requestedTo && (params.has('timeZone') || hasExplicitZone(requestedTo))) {
+      cameraTo = localDateTimeInZone(zonedDateTimeToEpochMs(requestedTo, sourceTimeZone), targetTimeZone, { seconds: false });
+    }
+  } catch (error) {
+    throw httpError(400, `Некорректный период или часовой пояс: ${publicError(error)}`);
+  }
+  if (cameraFrom) params.set('from', cameraFrom);
+  if (cameraTo) params.set('to', cameraTo);
+  params.delete('timeZone');
+  params.delete('cameraTimeZone');
+  return {
+    params,
+    publicRange: {
+      requestedFrom,
+      requestedTo,
+      cameraFrom,
+      cameraTo,
+      displayTimeZone: sourceTimeZone,
+      cameraTimeZone: targetTimeZone
+    }
+  };
+}
+
+function publicGoogleDriveConfig() {
+  try {
+    const config = readGoogleDriveConfig();
+    const oauthConfigured = Boolean(config.clientId && config.clientSecret && config.refreshToken);
+    const serviceAccountConfigured = Boolean(config.clientEmail && config.privateKey);
+    const resolvedAuthType = config.authType === 'auto'
+      ? oauthConfigured ? 'oauth' : serviceAccountConfigured ? 'service_account' : ''
+      : config.authType;
+    const credentialsConfigured = resolvedAuthType === 'oauth'
+      ? oauthConfigured
+      : resolvedAuthType === 'service_account' && serviceAccountConfigured;
+    return {
+      configured: Boolean(config.rootFolderId && credentialsConfigured),
+      rootFolderId: config.rootFolderId || '',
+      authType: resolvedAuthType,
+      account: resolvedAuthType === 'service_account' ? config.clientEmail : '',
+      folderUrl: config.rootFolderId ? `https://drive.google.com/drive/folders/${config.rootFolderId}` : ''
+    };
+  } catch (error) {
+    return { configured: false, rootFolderId: '', authType: '', account: '', error: publicError(error) };
+  }
+}
+
+async function mapWithConcurrency(items, requestedConcurrency, worker) {
+  const values = Array.from(items || []);
+  if (!values.length) return [];
+  const concurrency = Math.min(values.length, clampNumber(Number(requestedConcurrency) || 1, 1, 4));
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  const run = async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(values[index], index);
+    }
+  };
+  const settled = await Promise.allSettled(Array.from({ length: concurrency }, run));
+  const rejected = settled.find(item => item.status === 'rejected');
+  if (rejected) throw rejected.reason;
+  return results;
+}
+
 async function transcribeScheduledRecording(options) {
+  // Resolve the persisted model before taking the config snapshot and building
+  // cache keys (also when invoked outside the normal server startup path).
+  if (options.requestApi === localJsonApi) await transcriptionModelSettings.initialize();
+  const config = cameraConfig();
+  const vendor = normalizeVendor(options.vendor || options.settings?.vendor || config.vendor);
+  if (config.transcriptionXmProgressive && vendor === 'xm' && options.requestApi === localJsonApi) {
+    return transcribeXmScheduledRecordingStream({ ...options, config, vendor });
+  }
+  return transcribeScheduledRecordingByBlocks(options);
+}
+
+async function transcribeScheduledRecordingByBlocks(options) {
   let offsetSeconds = options.coverage.offsetSeconds;
   const endOffsetSeconds = options.coverage.offsetSeconds + options.coverage.durationSeconds;
   const chunkSeconds = scheduledTranscriptSeconds(options.settings);
@@ -2076,8 +3084,8 @@ async function transcribeScheduledRecording(options) {
     const chunk = {
       stage: 'transcript', channel: options.selection.channel,
       fileName: options.item.fileName || '', offsetSeconds, durationSeconds,
-      from: addSecondsToLocalDateTime(options.item.startTime || options.coverage.from, offsetSeconds),
-      to: addSecondsToLocalDateTime(options.item.startTime || options.coverage.from, offsetSeconds + durationSeconds)
+      from: scheduledChunkTime(options, offsetSeconds),
+      to: scheduledChunkTime(options, offsetSeconds + durationSeconds)
     };
     await options.onProgress?.(chunk);
     let data;
@@ -2087,24 +3095,588 @@ async function transcribeScheduledRecording(options) {
     } catch (error) {
       throw httpError(error.statusCode || 502, publicError(error), { ...chunk, cause: error.details });
     }
+    const finalBlock = durationSeconds >= remainingSeconds - 0.05;
+    if (!isTranscriptCachePayloadComplete(data, durationSeconds, { toleranceSeconds: finalBlock ? 1 : 0.1 })) {
+      throw httpError(502, 'Получен неполный аудиофрагмент; требуется повторное получение, а не отметка об отсутствии речи.', {
+        ...chunk, code: 'INCOMPLETE_AUDIO', expectedDurationSeconds: durationSeconds,
+        receivedDurationSeconds: data.durationSeconds
+      });
+    }
     appendScheduledOpenAiContext({
       contextLines: options.contextLines,
+      transcriptEntries: options.transcriptEntries,
       labels: options.labels,
       selection: options.selection,
       item: options.item,
+      settings: options.settings,
       segments: data.segments,
-      fallbackText: data.text
+      fallbackText: data.text,
+      fallbackStartSeconds: offsetSeconds,
+      fallbackEndSeconds: offsetSeconds + Math.max(
+        0,
+        Math.min(Number(data.durationSeconds) || durationSeconds, remainingSeconds)
+      )
     });
 
-    const consumedSeconds = Math.max(0.5, Math.min(data.durationSeconds || durationSeconds, remainingSeconds));
+    const consumedSeconds = Math.min(data.durationSeconds, remainingSeconds);
     offsetSeconds += consumedSeconds;
     const progress = options.progress || {};
     await options.onProgress?.({
       completedChunks: (progress.completedChunks || 0) + 1,
       transcribedSeconds: (progress.transcribedSeconds || 0) + consumedSeconds,
-      selectionProcessedSeconds: (progress.selectionProcessedSeconds || 0) + consumedSeconds
+      selectionProcessedSeconds: (progress.selectionProcessedSeconds || 0) + consumedSeconds,
+      transcriptTiming: { cached: Boolean(data.cached), ...(data.timings || {}) }
     });
+    if (finalBlock) return;
   }
+}
+
+const XM_PROGRESSIVE_CACHE_PIPELINE = 'xm-continuous-pcm-v1';
+const TRANSCRIPTION_PCM_SAMPLE_RATE = 16000;
+const TRANSCRIPTION_PCM_BYTES_PER_SAMPLE = 2;
+const XM_RECORDING_END_TOLERANCE_SECONDS = 1;
+const XM_PARTIAL_TAIL_MIN_SECONDS = 0.25;
+
+function xmArchiveEndShortfallIsTolerable(expectedSeconds, receivedSeconds) {
+  if (!(expectedSeconds > 0) || !(receivedSeconds > 0)) return false;
+  const toleranceSeconds = Math.min(XM_RECORDING_END_TOLERANCE_SECONDS, expectedSeconds * 0.1);
+  return receivedSeconds + toleranceSeconds >= expectedSeconds;
+}
+
+function xmArchivePartialTailIsUsable(expectedSeconds, receivedSeconds) {
+  return expectedSeconds > 0
+    && receivedSeconds >= XM_PARTIAL_TAIL_MIN_SECONDS
+    && receivedSeconds < expectedSeconds;
+}
+
+function xmRecoveryCacheVariants(options, block, context) {
+  return xmRecoveryPlans(block, options.coverage.offsetSeconds).map(plan => {
+    const query = new URLSearchParams(context.baseQuery);
+    query.set('duration', String(block.durationSeconds));
+    query.set('offsetSeconds', String(block.offsetSeconds));
+    return { plan, cacheKey: transcriptCacheKey(context.config, query, {
+      vendor: 'xm', channel: context.channel, stream: context.stream,
+      audioFilter: context.audioFilter, durationSeconds: block.durationSeconds,
+      offsetSeconds: block.offsetSeconds, pipeline: XM_RECOVERY_PIPELINE,
+      anchorOffsetSeconds: plan.captureOffsetSeconds,
+      sessionEndOffsetSeconds: block.offsetSeconds + block.durationSeconds
+    }) };
+  });
+}
+
+async function readXmRecoveryCache(options, block, context) {
+  const readCache = context.services?.readCache || readTranscriptCache;
+  for (const variant of xmRecoveryCacheVariants(options, block, context)) {
+    const cached = await readCache(variant.cacheKey);
+    if (cached?.source?.recovery?.sourceAudioComplete === true
+      && isTranscriptCachePayloadComplete(cached, block.durationSeconds, { toleranceSeconds: 0.05 })) return cached;
+  }
+  return null;
+}
+
+async function transcribeXmRecoveryBlock(options, block, context) {
+  const services = context.services || {};
+  const cached = await readXmRecoveryCache(options, block, context);
+  if (cached) return { ...cached, cached: true };
+  const openSession = services.openSession || (capture => openXmArchivePcmSession(
+    context.config, context.baseQuery, context.channel, context.stream,
+    { ...capture, audioFilter: context.audioFilter }
+  ));
+  let lastError;
+  for (const { plan, cacheKey } of xmRecoveryCacheVariants(options, block, context)) {
+    options.signal?.throwIfAborted();
+    let audio;
+    const captureStartedAt = Date.now();
+    try {
+      audio = await readXmRecoveryPcm(plan, openSession, options.signal);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      if (error.details?.code !== 'INCOMPLETE_AUDIO') throw error;
+      lastError = error;
+      // A warmup seek can land on another packet boundary. One direct request
+      // is allowed; neither a short stream nor repeated EOF proves silence.
+      continue;
+    }
+    const captureMs = Date.now() - captureStartedAt;
+    const audioPath = path.join(TRANSCRIPT_DIR, `archive-recovery-${Date.now()}-${crypto.randomUUID()}.wav`);
+    try {
+      await (services.writeWav || writePcm16Wav)(audioPath, audio.pcm, TRANSCRIPTION_PCM_SAMPLE_RATE, 1);
+      const asrStartedAt = Date.now();
+      const result = await (services.transcribe || transcribeWithGigaAm)(context.config, audioPath, {
+        chunkSeconds: context.config.transcriptionChunkSeconds,
+        offsetSeconds: block.offsetSeconds, signal: options.signal
+      });
+      const asrMs = Date.now() - asrStartedAt;
+      if (!isTranscriptCachePayloadComplete(result, audio.durationSeconds, { toleranceSeconds: 0.05 })
+        || !isTranscriptCachePayloadComplete(result, block.durationSeconds, { toleranceSeconds: 0.05 })) {
+        throw httpError(502, 'Модель вернула результат без подтверждённой длительности аудио.', {
+          code: 'INVALID_ASR_DURATION', expectedDurationSeconds: audio.durationSeconds,
+          receivedDurationSeconds: result.durationSeconds
+        });
+      }
+      const payload = {
+        ok: true, mode: 'archive', vendor: 'xm', channel: context.channel,
+        stream: context.stream, audioFilter: context.audioFilter, model: context.config.gigaamModel,
+        from: scheduledChunkTime(options, block.offsetSeconds),
+        to: scheduledChunkTime(options, block.offsetSeconds + result.durationSeconds),
+        offsetSeconds: block.offsetSeconds, durationSeconds: result.durationSeconds, partial: false,
+        text: result.text, segments: result.segments || [],
+        source: {
+          version: 2, host: context.config.host, fileName: options.item.fileName || '',
+          recordingStart: options.item.startTime,
+          cameraTimeZone: configuredCameraTimeZone(options.settings),
+          requestedDurationSeconds: block.durationSeconds,
+          recovery: { ...plan, sourceAudioComplete: true, rawBytes: audio.stats.rawBytes,
+            timingBasis: 'recorder-requested-seek-and-sample-count' }
+        },
+        tookMs: captureMs + asrMs,
+        timings: { pipeline: XM_RECOVERY_PIPELINE, anchorOffsetSeconds: plan.captureOffsetSeconds,
+          sessionEndOffsetSeconds: block.offsetSeconds + block.durationSeconds,
+          discardSeconds: plan.discardSeconds, captureMs, asrMs, totalMs: captureMs + asrMs }
+      };
+      await (services.writeCache || writeTranscriptCache)(cacheKey, payload);
+      await options.onProgress?.({ recordingCapture: {
+        fileName: options.item.fileName || '', ...audio.stats,
+        recovery: true, offsetSeconds: block.offsetSeconds,
+        captureOffsetSeconds: plan.captureOffsetSeconds, discardSeconds: plan.discardSeconds
+      } });
+      return payload;
+    } finally {
+      await (services.unlink || (file => fs.promises.unlink(file).catch(() => {})))(audioPath);
+    }
+  }
+  throw lastError || httpError(502, 'Не удалось получить аудиофрагмент целиком.', { code: 'INCOMPLETE_AUDIO' });
+}
+
+async function transcribeXmScheduledRecordingStream(options) {
+  const config = options.config || cameraConfig();
+  const channel = positiveInt(String(options.selection.channel), 1);
+  const stream = String(options.settings?.stream || 'main');
+  const audioFilter = normalizeAudioFilter(options.settings?.audioFilter || config.audioFilter);
+  const chunkSeconds = scheduledTranscriptSeconds(options.settings);
+  const endOffsetSeconds = options.coverage.offsetSeconds + options.coverage.durationSeconds;
+  const baseQuery = scheduledRecordingQuery(
+    options.item,
+    channel,
+    options.coverage,
+    options.settings,
+    'xm'
+  );
+  const blocks = [];
+  const recoveryContext = { config, baseQuery, channel, stream, audioFilter };
+
+  for (let offsetSeconds = options.coverage.offsetSeconds; offsetSeconds < endOffsetSeconds - 0.05;) {
+    const durationSeconds = Math.min(chunkSeconds, endOffsetSeconds - offsetSeconds);
+    const query = new URLSearchParams(baseQuery);
+    query.set('duration', String(durationSeconds));
+    query.set('offsetSeconds', String(offsetSeconds));
+    const cacheKey = transcriptCacheKey(config, query, {
+      vendor: 'xm', channel, stream, audioFilter, durationSeconds, offsetSeconds,
+      pipeline: XM_PROGRESSIVE_CACHE_PIPELINE,
+      anchorOffsetSeconds: options.coverage.offsetSeconds,
+      sessionEndOffsetSeconds: endOffsetSeconds
+    });
+    blocks.push({ offsetSeconds, durationSeconds, cacheKey });
+    offsetSeconds += durationSeconds;
+  }
+
+  let blockIndex = 0;
+  let firstMissingCacheLookupMs = 0;
+  let hasIncompleteCache = false;
+  while (blockIndex < blocks.length) {
+    options.signal?.throwIfAborted();
+    const lookupStartedAt = Date.now();
+    let cached = await readTranscriptCache(blocks[blockIndex].cacheKey);
+    const storedPayload = cached;
+    if (!isTranscriptCachePayloadComplete(cached, blocks[blockIndex].durationSeconds, {
+      toleranceSeconds: 0.05
+    })) cached = await readXmRecoveryCache(options, blocks[blockIndex], recoveryContext);
+    const cacheLookupMs = Date.now() - lookupStartedAt;
+    if (!isTranscriptCachePayloadComplete(cached, blocks[blockIndex].durationSeconds, {
+      toleranceSeconds: 0.05
+    })) {
+      hasIncompleteCache = Boolean(storedPayload);
+      firstMissingCacheLookupMs = cacheLookupMs;
+      break;
+    }
+    const cachedBlock = blocks[blockIndex];
+    await publishScheduledTranscriptBlock(options, cachedBlock, cached, { cached: true, cacheLookupMs });
+    blockIndex += 1;
+  }
+  if (blockIndex >= blocks.length) return;
+
+  assertTranscriptionPrepared();
+  await transcriptionModelSettings.initialize().catch(() => {});
+  if (transcriptionModelSettings.saving) {
+    throw httpError(503, 'Выбор модели сохраняется. Повторите запрос после сохранения.');
+  }
+  requireCameraAuth(config);
+  const ffmpeg = await checkFfmpeg(config.ffmpegPath);
+  if (!ffmpeg.available) {
+    throw httpError(503, 'ffmpeg is not available. Install ffmpeg or set FFMPEG_PATH to ffmpeg.exe.', ffmpeg);
+  }
+  const transcriber = await checkTranscriber(config.pythonPath);
+  if (!transcriber.available) {
+    throw httpError(503, 'GigaAM is not available. Install the Python gigaam package or set PYTHON_PATH.', transcriber);
+  }
+
+  await fs.promises.mkdir(TRANSCRIPT_DIR, { recursive: true });
+  const useTargetedRecovery = await shouldRecoverXmRecordingFromCache(blocks, blockIndex, hasIncompleteCache,
+    async block => {
+      options.signal?.throwIfAborted();
+      const cached = await readTranscriptCache(block.cacheKey);
+      return isTranscriptCachePayloadComplete(cached, block.durationSeconds, {
+        toleranceSeconds: 0.05
+      }) || Boolean(await readXmRecoveryCache(options, block, recoveryContext));
+    });
+  if (useTargetedRecovery) {
+    // Preserve the completed prefix. Each missing block has a bounded seek and
+    // its own versioned filter anchor; do not decode the whole prefix again.
+    activeTranscriptionRequests += 1;
+    try {
+      for (; blockIndex < blocks.length; blockIndex += 1) {
+        const block = blocks[blockIndex];
+        options.signal?.throwIfAborted();
+        await options.onProgress?.(scheduledTranscriptChunkDetails(options, block));
+        try {
+          const cached = await readTranscriptCache(block.cacheKey);
+          const payload = isTranscriptCachePayloadComplete(cached, block.durationSeconds, {
+            toleranceSeconds: 0.05
+          }) ? { ...cached, cached: true } : await transcribeXmRecoveryBlock(options, block, recoveryContext);
+          await publishScheduledTranscriptBlock(options, block, payload, {
+            ...payload.timings, cached: Boolean(payload.cached)
+          }, false);
+        } catch (error) {
+          options.signal?.throwIfAborted();
+          throw httpError(error.statusCode || 502, publicError(error), {
+            ...scheduledTranscriptChunkDetails(options, block),
+            pipeline: XM_RECOVERY_PIPELINE, cause: error.details
+          });
+        }
+      }
+      return;
+    } finally {
+      activeTranscriptionRequests -= 1;
+    }
+  }
+  const firstBlockIndex = blockIndex;
+  // Always start at the coverage anchor. The voice filter is stateful, so a
+  // cached block must not depend on which earlier block happened to miss.
+  const captureOffsetSeconds = options.coverage.offsetSeconds;
+  const captureDurationSeconds = options.coverage.durationSeconds;
+  const bytesPerChunk = Math.round(
+    chunkSeconds * TRANSCRIPTION_PCM_SAMPLE_RATE * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE
+  );
+  let session;
+  let pcmSpool;
+  let currentBlock = blocks[blockIndex];
+  let totalAsrMs = 0;
+  let totalCaptureMs = 0;
+  activeTranscriptionRequests += 1;
+
+  try {
+    session = await openXmArchivePcmSession(config, baseQuery, channel, stream, {
+      audioFilter,
+      durationSeconds: captureDurationSeconds,
+      offsetSeconds: captureOffsetSeconds,
+      signal: options.signal
+    });
+    // Drain the recorder continuously even while ASR is loading/processing.
+    // A temporary bounded PCM file keeps RAM bounded and still exposes the
+    // first block immediately, without waiting for the whole recording.
+    pcmSpool = await createPcmSpool(session.readable, {
+      directory: TRANSCRIPT_DIR,
+      maxBytes: Math.ceil((captureDurationSeconds + 0.1) * TRANSCRIPTION_PCM_SAMPLE_RATE * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE),
+      signal: options.signal
+    });
+    const iterator = chunkFixedPcm(pcmSpool.readable, bytesPerChunk)[Symbol.asyncIterator]();
+
+    if (firstBlockIndex > 0) {
+      const skippedCaptureStartedAt = Date.now();
+      for (let skippedIndex = 0; skippedIndex < firstBlockIndex; skippedIndex += 1) {
+        const skipped = await iterator.next();
+        if (skipped.done) {
+          throw httpError(502, 'Архивный поток оборвался до необработанного фрагмента; кэш сохранён.', {
+            code: 'INCOMPLETE_AUDIO', offsetSeconds: currentBlock.offsetSeconds, endOffsetSeconds
+          });
+        }
+        const skippedDurationSeconds = skipped.value.length
+          / (TRANSCRIPTION_PCM_SAMPLE_RATE * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE);
+        if (skippedDurationSeconds + 0.1 < blocks[skippedIndex].durationSeconds) {
+          throw httpError(502, 'Архивный поток короче сохранённого кэша; требуется повторное получение аудио.', {
+            code: 'INCOMPLETE_AUDIO', offsetSeconds: currentBlock.offsetSeconds, endOffsetSeconds
+          });
+        }
+      }
+      totalCaptureMs += Date.now() - skippedCaptureStartedAt;
+    }
+
+    while (blockIndex < blocks.length) {
+      options.signal?.throwIfAborted();
+      currentBlock = blocks[blockIndex];
+      const chunkDetails = scheduledTranscriptChunkDetails(options, currentBlock);
+      await options.onProgress?.(chunkDetails);
+
+      let cacheLookupMs = blockIndex === firstBlockIndex ? firstMissingCacheLookupMs : 0;
+      let cached = null;
+      if (blockIndex !== firstBlockIndex) {
+        const lookupStartedAt = Date.now();
+        cached = await readTranscriptCache(currentBlock.cacheKey);
+        if (!isTranscriptCachePayloadComplete(cached, currentBlock.durationSeconds, {
+          toleranceSeconds: 0.05
+        })) cached = null;
+        cacheLookupMs = Date.now() - lookupStartedAt;
+      }
+
+      const captureStartedAt = Date.now();
+      const next = await iterator.next();
+      const captureMs = Date.now() - captureStartedAt;
+      totalCaptureMs += captureMs;
+      if (next.done) {
+        const captureStats = await session.done;
+        if (blockIndex === blocks.length - 1) {
+          const recovered = await transcribeXmRecoveryBlock(options, currentBlock, recoveryContext);
+          await publishScheduledTranscriptBlock(options, currentBlock, recovered, recovered.timings, false);
+          blockIndex += 1;
+          continue;
+        }
+        throw httpError(502, 'Архивное аудио закончилось до конца периода; готовые блоки сохранены.', {
+          code: 'INCOMPLETE_AUDIO', sourceGapConfirmed: false,
+          offsetSeconds: currentBlock.offsetSeconds, endOffsetSeconds,
+          expectedDurationSeconds: currentBlock.durationSeconds, receivedDurationSeconds: 0, captureStats
+        });
+      }
+
+      const pcm = next.value;
+      const pcmDurationSeconds = pcm.length
+        / (TRANSCRIPTION_PCM_SAMPLE_RATE * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE);
+      const tolerableRecordingTail = blockIndex === blocks.length - 1
+        && isTranscriptCachePayloadComplete({ durationSeconds: pcmDurationSeconds }, currentBlock.durationSeconds, {
+          toleranceSeconds: 0.05
+        });
+      const usablePartialTail = !tolerableRecordingTail && xmArchivePartialTailIsUsable(
+        currentBlock.durationSeconds,
+        pcmDurationSeconds
+      );
+      if (usablePartialTail && blockIndex === blocks.length - 1) {
+        // EOF is not proof that the source is silent: retry this exact block
+        // before rejecting a whole day's export. Keep the original cache key
+        // untouched because the new filter anchor is different.
+        await session.done;
+        const recovered = await transcribeXmRecoveryBlock(options, currentBlock, recoveryContext);
+        await publishScheduledTranscriptBlock(options, currentBlock, recovered, recovered.timings, false);
+        blockIndex += 1;
+        continue;
+      }
+      if (pcmDurationSeconds + 0.1 < currentBlock.durationSeconds
+        && !tolerableRecordingTail
+        && !usablePartialTail) {
+        throw httpError(502, 'XM archive audio block is shorter than expected.', {
+          expectedDurationSeconds: currentBlock.durationSeconds,
+          receivedDurationSeconds: pcmDurationSeconds
+        });
+      }
+
+      if (cached) {
+        await publishScheduledTranscriptBlock(options, currentBlock, cached, {
+          cached: true, cacheLookupMs, captureMs
+        }, false);
+        blockIndex += 1;
+        continue;
+      }
+
+      const audioPath = path.join(
+        TRANSCRIPT_DIR,
+        `archive-stream-${Date.now()}-${crypto.randomUUID()}.wav`
+      );
+      try {
+        await writePcm16Wav(audioPath, pcm, TRANSCRIPTION_PCM_SAMPLE_RATE, 1);
+        const asrStartedAt = Date.now();
+        const result = await transcribeWithGigaAm(config, audioPath, {
+          chunkSeconds: config.transcriptionChunkSeconds,
+          offsetSeconds: currentBlock.offsetSeconds,
+          signal: options.signal
+        });
+        const asrMs = Date.now() - asrStartedAt;
+        totalAsrMs += asrMs;
+        if (!isTranscriptCachePayloadComplete(result, pcmDurationSeconds, { toleranceSeconds: 0.1 })) {
+          throw httpError(502, 'Модель вернула результат без подтверждённой длительности аудио.', {
+            code: 'INVALID_ASR_DURATION', expectedDurationSeconds: pcmDurationSeconds,
+            receivedDurationSeconds: result.durationSeconds
+          });
+        }
+        const payload = {
+          ok: true,
+          mode: 'archive',
+          vendor: 'xm',
+          channel,
+          stream,
+          from: scheduledChunkTime(options, currentBlock.offsetSeconds),
+          to: scheduledChunkTime(options, currentBlock.offsetSeconds + result.durationSeconds),
+          offsetSeconds: currentBlock.offsetSeconds,
+          audioFilter,
+          model: config.gigaamModel,
+          durationSeconds: result.durationSeconds,
+          partial: usablePartialTail,
+          source: {
+            version: 1, host: config.host, fileName: options.item.fileName || '',
+            recordingStart: options.item.startTime, cameraTimeZone: configuredCameraTimeZone(options.settings),
+            requestedDurationSeconds: currentBlock.durationSeconds
+          },
+          text: result.text,
+          segments: result.segments || [],
+          tookMs: cacheLookupMs + captureMs + asrMs,
+          timings: {
+            pipeline: XM_PROGRESSIVE_CACHE_PIPELINE,
+            anchorOffsetSeconds: options.coverage.offsetSeconds,
+            sessionEndOffsetSeconds: endOffsetSeconds,
+            cacheLookupMs,
+            captureMs,
+            asrMs,
+            totalMs: cacheLookupMs + captureMs + asrMs
+          }
+        };
+        await writeTranscriptCache(currentBlock.cacheKey, payload);
+        await publishScheduledTranscriptBlock(options, currentBlock, payload, payload.timings, false);
+        if (usablePartialTail) {
+          const captureStats = await session.done;
+          throw httpError(502, 'Получен неполный аудиофрагмент; кэш сохранён, недостающий интервал будет запрошен повторно.', {
+            code: 'INCOMPLETE_AUDIO', expectedDurationSeconds: currentBlock.durationSeconds,
+            receivedDurationSeconds: pcmDurationSeconds,
+            captureStats,
+            missingFrom: scheduledChunkTime(options, currentBlock.offsetSeconds + pcmDurationSeconds),
+            missingTo: scheduledChunkTime(options, endOffsetSeconds)
+          });
+        }
+      } finally {
+        await fs.promises.unlink(audioPath).catch(() => {});
+      }
+      blockIndex += 1;
+    }
+
+    const extra = await iterator.next();
+    const toleratedTailBytes = Math.ceil(
+      0.1 * TRANSCRIPTION_PCM_SAMPLE_RATE * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE
+    );
+    if (!extra.done && extra.value?.length > toleratedTailBytes) {
+      throw httpError(502, 'XM archive audio produced more data than the requested recording range.');
+    }
+    await pcmSpool.done;
+    const sessionStats = await session.done;
+    await options.onProgress?.({ recordingCapture: { fileName: options.item.fileName || '', ...sessionStats } });
+    console.log(
+      `XM progressive transcription: channel ${channel}, ${formatDuration(captureDurationSeconds)}s audio, `
+      + `${sessionStats.captureMs}ms capture, ${totalCaptureMs}ms waiting, ${totalAsrMs}ms ASR, `
+      + `${sessionStats.rawBytes} raw bytes.`
+    );
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    const details = scheduledTranscriptChunkDetails(options, currentBlock || blocks[firstBlockIndex]);
+    throw httpError(error.statusCode || 502, publicError(error), {
+      ...details,
+      pipeline: XM_PROGRESSIVE_CACHE_PIPELINE,
+      cause: error.details
+    });
+  } finally {
+    await session?.close().catch(() => {});
+    await pcmSpool?.close().catch(error => console.warn(`PCM spool cleanup failed: ${publicError(error)}`));
+    activeTranscriptionRequests -= 1;
+  }
+}
+
+function scheduledTranscriptChunkDetails(options, block) {
+  return {
+    stage: 'transcript',
+    channel: options.selection.channel,
+    fileName: options.item.fileName || '',
+    offsetSeconds: block.offsetSeconds,
+    durationSeconds: block.durationSeconds,
+    from: scheduledChunkTime(options, block.offsetSeconds),
+    to: scheduledChunkTime(options, block.offsetSeconds + block.durationSeconds)
+  };
+}
+
+function scheduledChunkTime(options, offsetSeconds) {
+  const base = options.item.startTime || options.coverage.from;
+  if (!options.settings?.cameraTimeZone && !options.settings?.displayTimeZone) {
+    return addSecondsToLocalDateTime(base, offsetSeconds);
+  }
+  const epoch = absoluteSegmentEpochMs(base, offsetSeconds, configuredCameraTimeZone(options.settings));
+  return Number.isFinite(epoch) ? new Date(epoch).toISOString() : addSecondsToLocalDateTime(base, offsetSeconds);
+}
+
+async function publishScheduledTranscriptBlock(options, block, data, timing = {}, publishStage = true) {
+  if (publishStage) await options.onProgress?.(scheduledTranscriptChunkDetails(options, block));
+  appendScheduledOpenAiContext({
+    contextLines: options.contextLines,
+    transcriptEntries: options.transcriptEntries,
+    labels: options.labels,
+    selection: options.selection,
+    item: options.item,
+    settings: options.settings,
+    segments: data.segments,
+    fallbackText: data.text,
+    fallbackStartSeconds: block.offsetSeconds,
+    fallbackEndSeconds: block.offsetSeconds + Math.max(
+      0,
+      Number(data.durationSeconds) || block.durationSeconds
+    )
+  });
+  const progress = options.progress || {};
+  const transcribedDurationSeconds = transcriptPayloadDuration(data, block.durationSeconds);
+  await options.onProgress?.({
+    completedChunks: (progress.completedChunks || 0) + 1,
+    transcribedSeconds: (progress.transcribedSeconds || 0) + transcribedDurationSeconds,
+    selectionProcessedSeconds: (progress.selectionProcessedSeconds || 0) + block.durationSeconds,
+    transcriptTiming: timing
+  });
+}
+
+function transcriptPayloadDuration(payload, fallbackSeconds) {
+  const durationSeconds = Number(payload?.durationSeconds);
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return Number(fallbackSeconds) || 0;
+  return Math.min(durationSeconds, Number(fallbackSeconds) || durationSeconds);
+}
+
+async function* chunkFixedPcm(readable, bytesPerChunk) {
+  if (!Number.isSafeInteger(bytesPerChunk) || bytesPerChunk <= 0) {
+    throw new TypeError('PCM bytesPerChunk must be a positive integer.');
+  }
+  let pending = Buffer.alloc(0);
+  for await (const value of readable) {
+    const incoming = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    if (!incoming.length) continue;
+    let data = pending.length ? Buffer.concat([pending, incoming]) : incoming;
+    let offset = 0;
+    while (data.length - offset >= bytesPerChunk) {
+      yield Buffer.from(data.subarray(offset, offset + bytesPerChunk));
+      offset += bytesPerChunk;
+    }
+    pending = offset < data.length ? Buffer.from(data.subarray(offset)) : Buffer.alloc(0);
+  }
+  if (pending.length) yield pending;
+}
+
+async function writePcm16Wav(filePath, pcm, sampleRate, channels) {
+  if (!Buffer.isBuffer(pcm) || !pcm.length || pcm.length % 2 !== 0) {
+    throw httpError(502, 'Decoded PCM audio is empty or misaligned.');
+  }
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * channels * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE;
+  header.write('RIFF', 0, 'ascii');
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii');
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(channels * TRANSCRIPTION_PCM_BYTES_PER_SAMPLE, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36, 'ascii');
+  header.writeUInt32LE(pcm.length, 40);
+  await fs.promises.writeFile(filePath, Buffer.concat([header, pcm]));
 }
 
 function scheduledCameraParams(settings, channel, vendorOverride = '') {
@@ -2142,6 +3714,7 @@ function scheduledTranscriptSeconds(settings) {
 }
 
 function scheduledReportTypes(candidate) {
+  if (candidate?.action?.destination === 'drive') return [];
   if (candidate?.periodMode === 'daily' && candidate.action?.reportDaily) return ['daily'];
   if (candidate?.periodMode === 'weekly' && candidate.action?.reportWeekly) return ['weekly'];
   return [];
@@ -2152,46 +3725,90 @@ function channelLabelFromRows(labels, channel) {
   return row?.label || `Канал ${channel}`;
 }
 
+function selectionCameraRange(selection, settings = {}) {
+  const displayTimeZone = configuredDisplayTimeZone(settings);
+  const cameraTimeZone = configuredCameraTimeZone(settings);
+  const convert = value => localDateTimeInZone(
+    zonedDateTimeToEpochMs(value, displayTimeZone),
+    cameraTimeZone,
+    { seconds: true }
+  );
+  return { from: convert(selection.from), to: convert(selection.to), cameraTimeZone, displayTimeZone };
+}
+
 function appendScheduledOpenAiContext(options) {
-  const segments = normalizedTranscriptSegments(options.segments, options.fallbackText);
+  const segments = normalizedTranscriptSegments(options.segments, options.fallbackText, {
+    start: options.fallbackStartSeconds,
+    end: options.fallbackEndSeconds
+  });
+  const label = channelLabelFromRows(options.labels, options.selection.channel);
+  const cameraTimeZone = configuredCameraTimeZone(options.settings);
+  const displayTimeZone = configuredDisplayTimeZone(options.settings);
   for (const segment of segments) {
+    const startMs = absoluteSegmentEpochMs(options.item.startTime, segment.start, cameraTimeZone);
+    const endMs = absoluteSegmentEpochMs(options.item.startTime, segment.end, cameraTimeZone);
+    const range = formatScheduledSegmentTime(options.item, segment, options.settings);
     options.contextLines.push([
-      `[${options.selection.groupName || 'Группа'} | ${channelLabelFromRows(options.labels, options.selection.channel)} | ${formatScheduledSegmentTime(options.item, segment)}]`,
+      `[${options.selection.groupName || 'Группа'} | ${label} | ${range}]`,
       String(segment.text || '').trim()
     ].filter(Boolean).join(' '));
+    if (Array.isArray(options.transcriptEntries)) {
+      options.transcriptEntries.push({
+        channel: Number(options.selection.channel),
+        label,
+        groupName: options.selection.groupName || 'Группа',
+        start: Number.isFinite(startMs) ? new Date(startMs).toISOString() : '',
+        end: Number.isFinite(endMs) ? new Date(endMs).toISOString() : '',
+        displayTimeZone,
+        text: String(segment.text || '').trim()
+      });
+    }
   }
   return segments.length;
 }
 
-function normalizedTranscriptSegments(segments = [], fallbackText = '') {
+function normalizedTranscriptSegments(segments = [], fallbackText = '', fallbackRange = {}) {
   const normalized = Array.isArray(segments) && segments.length
     ? segments
     : fallbackText
-      ? [{ text: fallbackText }]
+      ? [{
+          text: fallbackText,
+          start: fallbackRange.start,
+          end: fallbackRange.end
+        }]
       : [];
   return normalized.filter(segment => String(segment.text || '').trim());
 }
 
-function formatScheduledSegmentTime(item, segment) {
-  const start = absoluteSegmentDate(item.startTime, segment.start);
-  const end = absoluteSegmentDate(item.startTime, segment.end);
-  if (start && end) {
-    return `${formatReportDateTime(start.toISOString())} - ${formatReportDateTime(end.toISOString())}`;
+function formatScheduledSegmentTime(item, segment, settings = {}) {
+  const cameraTimeZone = configuredCameraTimeZone(settings);
+  const displayTimeZone = configuredDisplayTimeZone(settings);
+  const start = absoluteSegmentEpochMs(item.startTime, segment.start, cameraTimeZone);
+  const end = absoluteSegmentEpochMs(item.startTime, segment.end, cameraTimeZone);
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    return `${formatReportDateTime(new Date(start).toISOString(), displayTimeZone)} - ${formatReportDateTime(new Date(end).toISOString(), displayTimeZone)}`;
   }
-  return `${formatReportDateTime(item.startTime)} - ${formatReportDateTime(item.endTime)}`;
+  return `${formatReportDateTime(item.startTime, displayTimeZone, cameraTimeZone)} - ${formatReportDateTime(item.endTime, displayTimeZone, cameraTimeZone)}`;
 }
 
-function absoluteSegmentDate(baseValue, offsetSeconds) {
+function absoluteSegmentEpochMs(baseValue, offsetSeconds, sourceTimeZone = 'Europe/Moscow') {
   if (!Number.isFinite(Number(offsetSeconds))) return null;
-  const baseMs = localDateTimeMs(baseValue);
-  return Number.isFinite(baseMs) ? new Date(baseMs + (Number(offsetSeconds) * 1000)) : null;
+  try {
+    const baseMs = zonedDateTimeToEpochMs(baseValue, sourceTimeZone);
+    return baseMs + (Number(offsetSeconds) * 1000);
+  } catch {
+    return Number.NaN;
+  }
 }
 
-function recordingCoverageForRange(item, fromValue, toValue) {
-  const rangeStartMs = localDateTimeMs(fromValue);
-  const rangeEndMs = localDateTimeMs(toValue);
-  const itemStartMs = localDateTimeMs(item.startTime || fromValue);
-  const itemEndMs = localDateTimeMs(item.endTime || toValue);
+function recordingCoverageForRange(item, fromValue, toValue, sourceTimeZone = 'Europe/Moscow') {
+  const parse = value => {
+    try { return zonedDateTimeToEpochMs(value, sourceTimeZone); } catch { return Number.NaN; }
+  };
+  const rangeStartMs = parse(fromValue);
+  const rangeEndMs = parse(toValue);
+  const itemStartMs = parse(item.startTime || fromValue);
+  const itemEndMs = parse(item.endTime || toValue);
 
   if (![rangeStartMs, rangeEndMs, itemStartMs, itemEndMs].every(Number.isFinite)) {
     const fallbackSeconds = secondsBetween(item.startTime || fromValue, item.endTime || toValue);
@@ -2725,14 +4342,15 @@ async function searchDahuaRecordings(config, channel, from, to) {
   }
 }
 
-async function searchXmRecordings(config, channel, stream, from, to) {
-  const login = await xmLogin(config);
+async function searchXmRecordings(config, channel, stream, from, to, services = {}) {
+  const requestJson = services.requestJson || cameraJsonRequest;
+  const login = await (services.login || xmLogin)(config);
 
   try {
     const xmChannel = Math.max(0, channel - 1);
     const query = xmRecordingSearchQuery(login, xmChannel, stream, from, to);
 
-    const data = await cameraJsonRequest(config, '/cgi-bin/opdev.cgi', query);
+    const data = await requestJson(config, '/cgi-bin/opdev.cgi', query);
     if (data.Ret === 109) {
       return xmRecordingSearchResponse({
         channel,
@@ -2741,33 +4359,16 @@ async function searchXmRecordings(config, channel, stream, from, to) {
         from,
         to,
         warning: 'XM OPFileQuery returned Ret=109. No files were found for this period.',
+        warningSeverity: 'info',
+        searchOutcome: 'confirmed_empty',
         details: xmSearchErrorDetails(data, query, channel, xmChannel, stream),
         records: []
       });
     }
 
     if (data.Ret === 119) {
-      const fallback = await searchXmRecordingsByDay(config, login, channel, xmChannel, stream, from, to, data, query);
-      if (fallback.result) {
-        return fallback.result;
-      }
-
-      return xmRecordingSearchResponse({
-        channel,
-        xmChannel,
-        stream,
-        from,
-        to,
-        warning: 'Direct XM OPFileQuery returned Ret=119; daily archive search found no records inside the selected period.',
-        details: {
-          ...xmSearchErrorDetails(data, query, channel, xmChannel, stream),
-          fallback: fallback.details,
-          hint: xmRet119Hint()
-        },
-        xmRet: data.Ret,
-        message: 'XM archive returned no recordings for this period.',
-        records: []
-      });
+      const fallback = await searchXmRecordingsByDay(config, login, channel, xmChannel, stream, from, to, data, query, services);
+      return fallback.result;
     }
 
     if (data.Ret !== 100) {
@@ -2779,7 +4380,10 @@ async function searchXmRecordings(config, channel, stream, from, to) {
           from,
           to,
           xmRet: data.Ret,
-          message: 'XM archive returned no recordings for this period.',
+          searchOutcome: 'unconfirmed',
+          warning: 'XM archive search did not confirm whether recordings exist for this period.',
+          warningSeverity: 'warning',
+          message: 'XM archive availability could not be confirmed for this period.',
           details: xmSearchErrorDetails(data, query, channel, xmChannel, stream),
           records: []
         });
@@ -2787,6 +4391,8 @@ async function searchXmRecordings(config, channel, stream, from, to) {
 
       throw httpError(502, `XM recording search failed. Ret=${data.Ret ?? 'unknown'}`, {
         ...xmSearchErrorDetails(data, query, channel, xmChannel, stream),
+        stage: 'search',
+        searchOutcome: 'protocol_error',
         hint: ''
       });
     }
@@ -2794,7 +4400,7 @@ async function searchXmRecordings(config, channel, stream, from, to) {
     const records = xmRecordList(data.OPFileQuery);
     return xmRecordingSearchResponse({ channel, xmChannel, stream, from, to, records });
   } finally {
-    await xmLogout(config, login).catch(() => {});
+    await (services.logout || xmLogout)(config, login).catch(() => {});
   }
 }
 
@@ -2816,41 +4422,62 @@ function xmRecordingSearchQuery(login, xmChannel, stream, from, to) {
   };
 }
 
-async function searchXmRecordingsByDay(config, login, channel, xmChannel, stream, from, to, originalData, originalQuery) {
+async function searchXmRecordingsByDay(config, login, channel, xmChannel, stream, from, to, originalData, originalQuery, services = {}) {
+  const requestJson = services.requestJson || cameraJsonRequest;
   const attempts = [];
   const records = [];
+  const ranges = xmSearchDayRanges(from, to);
+  const fallbackDetails = () => ({
+    strategy: 'daily OPFileQuery after Ret=119',
+    original: xmSearchErrorDetails(originalData, originalQuery, channel, xmChannel, stream),
+    attempts: [...attempts]
+  });
 
-  for (const range of xmSearchDayRanges(from, to)) {
+  for (const range of ranges) {
     const query = xmRecordingSearchQuery(login, xmChannel, stream, range.from, range.to);
+    let data;
     try {
-      const data = await cameraJsonRequest(config, '/cgi-bin/opdev.cgi', query);
-      attempts.push(xmSearchErrorDetails(data, query, channel, xmChannel, stream));
-
-      if (data.Ret === 100) {
-        records.push(...xmRecordList(data.OPFileQuery));
-      } else if (data.Ret !== 109 && data.Ret !== 119) {
-        break;
-      }
+      data = await requestJson(config, '/cgi-bin/opdev.cgi', query);
     } catch (error) {
       attempts.push({
         ...xmSearchErrorDetails({ Ret: error.statusCode || 'request_failed' }, query, channel, xmChannel, stream),
-        error: error.message || String(error)
+        error: publicError(error),
+        code: error.code || error.details?.code || error.cause?.code || ''
       });
-      break;
+      // A failed daily query cannot prove that the requested archive is empty,
+      // even if an earlier day returned some records successfully.
+      error.details = {
+        ...error.details,
+        stage: 'search',
+        searchOutcome: 'transient_error',
+        fallback: fallbackDetails()
+      };
+      throw error;
+    }
+    attempts.push(xmSearchErrorDetails(data, query, channel, xmChannel, stream));
+    if (data.Ret === 100) {
+      records.push(...xmRecordList(data.OPFileQuery));
+    } else if (data.Ret !== 109 && data.Ret !== 119) {
+      throw httpError(502, `XM daily recording search failed. Ret=${data.Ret ?? 'unknown'}`, {
+        ...xmSearchErrorDetails(data, query, channel, xmChannel, stream),
+        stage: 'search',
+        searchOutcome: 'protocol_error',
+        fallback: fallbackDetails()
+      });
     }
   }
 
-  const details = {
-    strategy: 'daily OPFileQuery after Ret=119',
-    original: xmSearchErrorDetails(originalData, originalQuery, channel, xmChannel, stream),
-    attempts
-  };
-  const usableFallback = attempts.some(attempt => attempt.ret === 100 || attempt.ret === 109);
-  if (!usableFallback) {
-    return { result: null, details };
-  }
-
   const filteredRecords = uniqueXmRecords(records).filter(record => xmRecordOverlaps(record, from, to));
+  const complete = ranges.length > 0
+    && ranges.at(-1).to.slice(0, 10) >= toXmLocalTime(to).slice(0, 10)
+    && attempts.every(attempt => attempt.ret === 100 || attempt.ret === 109);
+  const searchOutcome = complete ? (filteredRecords.length ? 'found' : 'confirmed_empty') : 'unconfirmed';
+  const details = {
+    ...fallbackDetails(),
+    searchOutcome,
+    searchComplete: complete,
+    ...(complete ? {} : { hint: xmRet119Hint() })
+  };
   return {
     result: xmRecordingSearchResponse({
       channel,
@@ -2858,9 +4485,13 @@ async function searchXmRecordingsByDay(config, login, channel, xmChannel, stream
       stream,
       from,
       to,
-      warning: filteredRecords.length
-        ? 'Direct XM OPFileQuery returned Ret=119; records were found through daily archive search.'
-        : 'Direct XM OPFileQuery returned Ret=119; daily archive search found no records inside the selected period.',
+      searchOutcome,
+      warningSeverity: complete ? 'info' : 'warning',
+      warning: !complete
+        ? 'Direct XM OPFileQuery returned Ret=119; daily archive search could not confirm availability for the whole requested period.'
+        : filteredRecords.length
+          ? 'Direct XM OPFileQuery returned Ret=119; records were found through daily archive search.'
+          : 'Direct XM OPFileQuery returned Ret=119; daily archive search confirmed no records inside the selected period.',
       details,
       records: filteredRecords
     }),
@@ -2869,6 +4500,7 @@ async function searchXmRecordingsByDay(config, login, channel, xmChannel, stream
 }
 
 function xmRecordingSearchResponse(options) {
+  const searchOutcome = options.searchOutcome || (options.records?.length ? 'found' : 'confirmed_empty');
   const response = {
     ok: true,
     vendor: 'xm',
@@ -2877,6 +4509,8 @@ function xmRecordingSearchResponse(options) {
     stream: options.stream,
     from: options.from,
     to: options.to,
+    searchOutcome,
+    searchComplete: searchOutcome !== 'unconfirmed',
     items: (options.records || []).map((item, index) => ({
       id: `xm-${index + 1}`,
       startTime: xmTimeToIso(item.BeginTime),
@@ -2893,6 +4527,7 @@ function xmRecordingSearchResponse(options) {
   };
 
   if (options.warning) response.warning = options.warning;
+  if (options.warningSeverity) response.warningSeverity = options.warningSeverity;
   if (options.details) response.details = options.details;
   return response;
 }
@@ -3122,6 +4757,38 @@ async function streamAudio(req, res, config, params, mode) {
   });
 }
 
+async function transcribeUploadedFile(req, res, params) {
+  requireMethod(req, 'POST');
+  validateAudioUpload(params, req.headers);
+  assertTranscriptionPrepared();
+  if (activeUploadedTranscriptions >= 2) throw httpError(429, 'Уже обрабатываются два загруженных файла. Дождитесь окончания и повторите попытку.');
+  activeUploadedTranscriptions += 1;
+  activeTranscriptionRequests += 1;
+  const signal = requestAbortSignal(req, res);
+  try {
+    await transcriptionModelSettings.initialize();
+    if (transcriptionModelSettings.saving) throw httpError(503, 'Выбор модели сохраняется. Повторите запрос после сохранения.');
+    const config = cameraConfig();
+    if (params.get('model') && params.get('model') !== config.gigaamModel) {
+      throw httpError(409, 'Модель в настройках изменилась. Запустите транскрибацию файлов заново.');
+    }
+    const [ffmpeg, transcriber] = await Promise.all([checkFfmpeg(config.ffmpegPath), checkTranscriber(config.pythonPath)]);
+    signal.throwIfAborted();
+    if (!ffmpeg.available) throw httpError(503, 'FFmpeg недоступен. Проверьте настройку FFMPEG_PATH.');
+    if (!transcriber.available) throw httpError(503, 'GigaAM недоступна. Проверьте окружение транскрибации в настройках.');
+    const settings = await readAppSetting('ui_settings').catch(() => ({}));
+    return await handleAudioFileTranscription(req, res, params, {
+      config, signal, tempRoot: TRANSCRIPT_DIR,
+      timeZone: normalizeTimeZone(params.get('timeZone'), configuredDisplayTimeZone(settings)),
+      audioFilter: audioFilterGraph(normalizeAudioFilter(params.get('audioFilter') || settings?.audioFilter || config.audioFilter)),
+      transcribe: transcribeWithGigaAm, chunkFixedPcm, writePcm16Wav, publicError
+    });
+  } finally {
+    activeUploadedTranscriptions -= 1;
+    activeTranscriptionRequests -= 1;
+  }
+}
+
 async function handleTranscriptionRequest(req, res, params, mode) {
   assertTranscriptionPrepared();
   await transcriptionModelSettings.initialize().catch(() => {});
@@ -3136,7 +4803,40 @@ async function handleTranscriptionRequest(req, res, params, mode) {
 
 async function transcribeAudio(req, res, config, params, mode) {
   requireCameraAuth(config);
+  const requestStartedAt = Date.now();
+  const vendor = normalizeVendor(params.get('vendor') || config.vendor);
+  const channel = positiveInt(params.get('channel'), 1);
+  const stream = params.get('stream') || 'main';
+  const source = params.get('source') || '';
+  const from = params.get('from') || '';
+  const to = params.get('to') || '';
+  const audioFilter = normalizeAudioFilter(params.get('audioFilter') || config.audioFilter);
+  const durationSeconds = transcriptionDurationSeconds(params, config, mode);
+  const offsetSeconds = positiveFloat(params.get('offsetSeconds'));
+  const captureFrom = mode === 'archive' && from && offsetSeconds > 0 ? addSecondsToLocalDateTime(from, offsetSeconds) : from;
+  const captureTo = mode === 'archive' && captureFrom && durationSeconds > 0 ? addSecondsToLocalDateTime(captureFrom, durationSeconds) : to;
+  const cacheKey = mode === 'archive'
+    ? transcriptCacheKey(config, params, { vendor, channel, stream, audioFilter, durationSeconds, offsetSeconds })
+    : '';
+  const signal = requestAbortSignal(req, res);
+  let cacheLookupMs = 0;
 
+  if (cacheKey) {
+    const cacheStartedAt = Date.now();
+    const cached = await readTranscriptCache(cacheKey);
+    cacheLookupMs = Date.now() - cacheStartedAt;
+    if (isTranscriptCachePayloadComplete(cached, durationSeconds)) {
+      const servedInMs = Date.now() - requestStartedAt;
+      return json(res, 200, {
+        ...cached,
+        cached: true,
+        cacheLookupMs,
+        servedInMs
+      });
+    }
+  }
+
+  const prerequisitesStartedAt = Date.now();
   const ffmpeg = await checkFfmpeg(config.ffmpegPath);
   if (!ffmpeg.available) {
     return json(res, 503, {
@@ -3154,36 +4854,14 @@ async function transcribeAudio(req, res, config, params, mode) {
       transcriber
     });
   }
-
-  const vendor = normalizeVendor(params.get('vendor') || config.vendor);
-  const channel = positiveInt(params.get('channel'), 1);
-  const stream = params.get('stream') || 'main';
-  const source = params.get('source') || '';
-  const from = params.get('from') || '';
-  const to = params.get('to') || '';
-  const audioFilter = normalizeAudioFilter(params.get('audioFilter') || config.audioFilter);
-  const durationSeconds = transcriptionDurationSeconds(params, config, mode);
-  const offsetSeconds = positiveFloat(params.get('offsetSeconds'));
-  const captureFrom = mode === 'archive' && from && offsetSeconds > 0 ? addSecondsToLocalDateTime(from, offsetSeconds) : from;
-  const captureTo = mode === 'archive' && captureFrom && durationSeconds > 0 ? addSecondsToLocalDateTime(captureFrom, durationSeconds) : to;
-  const cacheKey = mode === 'archive'
-    ? transcriptCacheKey(config, params, { vendor, channel, stream, audioFilter, durationSeconds, offsetSeconds })
-    : '';
-  const startedAt = Date.now();
-  const signal = requestAbortSignal(req, res);
+  const prerequisitesMs = Date.now() - prerequisitesStartedAt;
 
   await fs.promises.mkdir(TRANSCRIPT_DIR, { recursive: true });
-
-  if (cacheKey) {
-    const cached = await readTranscriptCache(cacheKey);
-    if (cached) {
-      return json(res, 200, { ...cached, cached: true });
-    }
-  }
 
   const audioPath = path.join(TRANSCRIPT_DIR, `${mode}-${Date.now()}-${crypto.randomUUID()}.wav`);
 
   try {
+    const captureStartedAt = Date.now();
     if (mode === 'archive' && vendor === 'xm') {
       await captureXmArchiveWav(config, params, channel, stream, audioPath, {
         audioFilter,
@@ -3205,17 +4883,22 @@ async function transcribeAudio(req, res, config, params, mode) {
         signal
       });
     }
+    const captureMs = Date.now() - captureStartedAt;
 
     if (signal.aborted) return;
     await ensureAudioFileHasData(audioPath);
 
+    const asrStartedAt = Date.now();
     const result = await transcribeWithGigaAm(config, audioPath, {
       chunkSeconds: config.transcriptionChunkSeconds,
       offsetSeconds,
       signal
     });
+    const asrMs = Date.now() - asrStartedAt;
 
     if (signal.aborted) return;
+
+    const totalMs = Date.now() - requestStartedAt;
 
     const payload = {
       ok: true,
@@ -3229,9 +4912,20 @@ async function transcribeAudio(req, res, config, params, mode) {
       audioFilter,
       model: config.gigaamModel,
       durationSeconds: result.durationSeconds,
+      source: {
+        version: 1, host: config.host, fileName: params.get('fileName') || '',
+        recordingStart: from, cameraTimeZone: configuredCameraTimeZone(), requestedDurationSeconds: durationSeconds
+      },
       text: result.text,
       segments: result.segments || [],
-      tookMs: Date.now() - startedAt
+      tookMs: totalMs,
+      timings: {
+        cacheLookupMs,
+        prerequisitesMs,
+        captureMs,
+        asrMs,
+        totalMs
+      }
     };
 
     if (cacheKey) {
@@ -3368,28 +5062,29 @@ async function sendScheduledActionErrorEmail(candidate, run, services = {}) {
 }
 
 function scheduledActionErrorMessage(candidate, run, recipients) {
+  const displayTimeZone = normalizeTimeZone(candidate?.timeZone, configuredDisplayTimeZone());
   const stageLabels = {
     search: 'Поиск записей', transcript: 'Подготовка аудио и транскрибация',
-    ask: 'Запрос к OpenAI', report: 'Отправка отчёта', scheduler: 'Планировщик'
+    ask: 'Запрос к OpenAI', report: 'Отправка отчёта', drive: 'Загрузка на Google Диск', scheduler: 'Планировщик'
   };
   const progress = run.progress || {};
   const lines = [
     run.status === 'success' ? 'Фоновое действие выполнено с пропусками' : 'Ошибка фонового действия',
     `Действие: ${candidate.action.name}`,
-    `Период: ${formatReportDateTime(candidate.from)} - ${formatReportDateTime(candidate.to)}`,
-    `Часовой пояс: ${process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    `Период: ${formatReportDateTime(candidate.from, displayTimeZone)} - ${formatReportDateTime(candidate.to, displayTimeZone)}`,
+    `Часовой пояс: ${displayTimeZone}`,
     `Этап: ${stageLabels[run.stage] || run.stage || 'Выполнение'}`,
-    `Время ошибки: ${formatReportDateTime(run.finishedAt || run.at)}`,
+    `Время ошибки: ${formatReportDateTime(run.finishedAt || run.at, displayTimeZone)}`,
     `Вопрос: ${candidate.action.question || ''}`,
     `Ошибка: ${run.error || ''}`,
     `Готово частей: ${progress.completedChunks || 0}; аудио: ${progress.transcribedSeconds || 0} сек.; записей: ${progress.completedRecordings || 0}/${progress.knownRecordings || 0}`,
     progress.label ? `Камера/группа: ${progress.label}` : '',
     progress.fileName ? `Запись: ${progress.fileName}` : '',
-    progress.from ? `Фрагмент: ${formatReportDateTime(progress.from)} - ${formatReportDateTime(progress.to)}` : '',
+    progress.from ? `Фрагмент: ${formatReportDateTime(progress.from, displayTimeZone)} - ${formatReportDateTime(progress.to, displayTimeZone)}` : '',
     '',
     'Выбранные камеры:',
     ...(candidate.selections || []).map(selection =>
-      `${selection.groupName || 'Группа'}: камера ${selection.channel}, ${formatReportDateTime(selection.from)} - ${formatReportDateTime(selection.to)}`),
+      `${selection.groupName || 'Группа'}: камера ${selection.channel}, ${formatReportDateTime(selection.from, displayTimeZone)} - ${formatReportDateTime(selection.to, displayTimeZone)}`),
     ...(run.warnings?.length ? ['', 'Предупреждения:', ...run.warnings] : []),
     ...(run.details ? ['', 'Технические детали:', JSON.stringify(run.details, null, 2)] : [])
   ];
@@ -3438,13 +5133,15 @@ function reportEmailMessage(payload, reportType, recipients) {
   const reportLabel = reportType === 'weekly' ? 'за неделю' : 'за день';
   const subject = `Отчет ${reportLabel}: ${action.name || 'действие камер'}`;
   const generatedAt = payload.generatedAt || new Date().toISOString();
-  const period = `${formatReportDateTime(payload.from)} - ${formatReportDateTime(payload.to)}`;
+  const displayTimeZone = normalizeTimeZone(payload.timeZone, configuredDisplayTimeZone());
+  const period = `${formatReportDateTime(payload.from, displayTimeZone)} - ${formatReportDateTime(payload.to, displayTimeZone)}`;
   const attachment = buildReportDocxAttachment({ ...payload, recipients }, reportType);
 
   const text = [
     `Отчет ${reportLabel}`,
     `Действие: ${action.name || 'без названия'}`,
-    `Сформирован: ${formatReportDateTime(generatedAt)}`,
+    `Сформирован: ${formatReportDateTime(generatedAt, displayTimeZone)}`,
+    `Часовой пояс: ${displayTimeZone}`,
     `Период: ${period}`,
     ...(warnings.length ? [`Предупреждений при обработке: ${warnings.length}`] : []),
     '',
@@ -3455,7 +5152,8 @@ function reportEmailMessage(payload, reportType, recipients) {
     '<!doctype html><html><body style="font-family:Arial,sans-serif;line-height:1.45;color:#18212a">',
     `<h2>${escapeHtmlText(`Отчет ${reportLabel}`)}</h2>`,
     `<p><strong>Действие:</strong> ${escapeHtmlText(action.name || 'без названия')}</p>`,
-    `<p><strong>Сформирован:</strong> ${escapeHtmlText(formatReportDateTime(generatedAt))}</p>`,
+    `<p><strong>Сформирован:</strong> ${escapeHtmlText(formatReportDateTime(generatedAt, displayTimeZone))}</p>`,
+    `<p><strong>Часовой пояс:</strong> ${escapeHtmlText(displayTimeZone)}</p>`,
     `<p><strong>Период:</strong> ${escapeHtmlText(period)}</p>`,
     ...(warnings.length ? [`<p><strong>Предупреждений при обработке:</strong> ${warnings.length}</p>`] : []),
     `<p>DOCX-файл прикреплен: <strong>${escapeHtmlText(attachment.fileName)}</strong></p>`,
@@ -3481,8 +5179,9 @@ function reportMessageId(payload, reportType) {
 
 function buildReportDocxAttachment(payload, reportType) {
   const action = payload.action && typeof payload.action === 'object' ? payload.action : {};
-  const fromDate = reportDateKey(payload.from) || toDateInputLocal(new Date());
-  const toDate = reportDateKey(payload.to) || fromDate;
+  const displayTimeZone = normalizeTimeZone(payload.timeZone, configuredDisplayTimeZone());
+  const fromDate = reportDateKey(payload.from, displayTimeZone) || zonedDatePart(new Date(), displayTimeZone);
+  const toDate = reportDateKey(payload.to, displayTimeZone) || fromDate;
   const typePart = reportType === 'weekly' ? 'weekly' : 'daily';
   const namePart = slugFilePart(action.name || 'camera-report');
   const fileName = `camera-report-${typePart}-${fromDate}${toDate !== fromDate ? `-${toDate}` : ''}-${namePart}.docx`;
@@ -3521,6 +5220,7 @@ function reportDocxDocumentXml(payload, reportType) {
   const question = String(payload.question || '').trim() || 'Вопрос не указан.';
   const answer = String(payload.answer || '').trim() || 'Ответ не получен.';
   const warnings = normalizeReportWarnings(payload.warnings);
+  const displayTimeZone = normalizeTimeZone(payload.timeZone, configuredDisplayTimeZone());
 
   const blocks = [
     wParagraph('OPENAI API', 'Kicker'),
@@ -3528,8 +5228,9 @@ function reportDocxDocumentXml(payload, reportType) {
     wParagraph(action.name || 'Архив камер', 'Subtitle'),
     wTable([
       ['Действие', action.name || 'без названия'],
-      ['Сформирован', formatReportDateTime(generatedAt)],
-      ['Период анализа', `${formatReportDateTime(payload.from)} - ${formatReportDateTime(payload.to)}`],
+      ['Сформирован', formatReportDateTime(generatedAt, displayTimeZone)],
+      ['Период анализа', `${formatReportDateTime(payload.from, displayTimeZone)} - ${formatReportDateTime(payload.to, displayTimeZone)}`],
+      ['Часовой пояс', displayTimeZone],
       ['Модель', payload.model || 'не указана'],
       ['ID ответа', payload.responseId || 'не указан']
     ], [2100, 7260], false),
@@ -3542,9 +5243,9 @@ function reportDocxDocumentXml(payload, reportType) {
       ...warnings.flatMap(warning => wParagraphsForText(warning, 'BodyText'))
     ] : []),
     wParagraph('Метки по дням', 'Heading1'),
-    ...reportDaySectionsXml(payload, channels),
+    ...reportDaySectionsXml(payload, channels, displayTimeZone),
     wParagraph('Группы и камеры', 'Heading1'),
-    ...reportGroupBlocksXml(groups, channels),
+    ...reportGroupBlocksXml(groups, channels, displayTimeZone),
     wParagraph('Служебная информация', 'Heading1'),
     wTable([
       ['Тип отчета', reportLabel],
@@ -3572,15 +5273,15 @@ function reportDocxDocumentXml(payload, reportType) {
   ].join('');
 }
 
-function reportDaySectionsXml(payload, channels) {
-  const days = reportDaysBetween(payload.from, payload.to, channels);
+function reportDaySectionsXml(payload, channels, timeZone = configuredDisplayTimeZone()) {
+  const days = reportDaysBetween(payload.from, payload.to, channels, timeZone);
   if (!days.length) {
     return [wParagraph('Даты не определены.', 'MutedText')];
   }
 
   const result = [];
   for (const day of days) {
-    const dayChannels = channels.filter(item => reportRangeOverlapsDay(item.from, item.to, day));
+    const dayChannels = channels.filter(item => reportRangeOverlapsDay(item.from, item.to, day, timeZone));
     result.push(wParagraph(`Метка дня: ${formatReportDayLabel(day)}`, 'DayHeading', { keepNext: true }));
 
     if (!dayChannels.length) {
@@ -3593,15 +5294,15 @@ function reportDaySectionsXml(payload, channels) {
       ...dayChannels.map(item => [
         item.group || 'Группа',
         item.label || `Канал ${item.channel || ''}`,
-        reportTimeRange(item.from, item.to),
-        `${formatReportDateTime(item.from)} - ${formatReportDateTime(item.to)}`
+        reportTimeRange(item.from, item.to, timeZone),
+        `${formatReportDateTime(item.from, timeZone)} - ${formatReportDateTime(item.to, timeZone)}`
       ])
     ], [2160, 2160, 1440, 3600], true));
   }
   return result;
 }
 
-function reportGroupBlocksXml(groups, channels) {
+function reportGroupBlocksXml(groups, channels, timeZone = configuredDisplayTimeZone()) {
   if (!groups.length && !channels.length) {
     return [wParagraph('Группы и камеры не указаны.', 'MutedText')];
   }
@@ -3613,7 +5314,7 @@ function reportGroupBlocksXml(groups, channels) {
       ...groups.map(group => [
         group.name || 'Группа',
         (group.channels || []).join(', ') || 'не указаны',
-        `${formatReportDateTime(group.from)} - ${formatReportDateTime(group.to)}`
+        `${formatReportDateTime(group.from, timeZone, normalizeTimeZone(group.timeZone, timeZone))} - ${formatReportDateTime(group.to, timeZone, normalizeTimeZone(group.timeZone, timeZone))}`
       ])
     ], [2400, 2400, 4560], true));
   }
@@ -3625,7 +5326,7 @@ function reportGroupBlocksXml(groups, channels) {
       ...channels.map(item => [
         item.group || 'Группа',
         item.label || `Канал ${item.channel || ''}`,
-        `${formatReportDateTime(item.from)} - ${formatReportDateTime(item.to)}`
+        `${formatReportDateTime(item.from, timeZone)} - ${formatReportDateTime(item.to, timeZone)}`
       ])
     ], [2400, 2400, 4560], true));
   }
@@ -3633,10 +5334,10 @@ function reportGroupBlocksXml(groups, channels) {
   return blocks;
 }
 
-function reportDaysBetween(fromValue, toValue, channels = []) {
+function reportDaysBetween(fromValue, toValue, channels = [], timeZone = configuredDisplayTimeZone()) {
   const dates = new Set();
-  const start = reportDateFromKey(reportDateKey(fromValue));
-  const end = reportDateFromKey(reportDateKey(toValue));
+  const start = reportDateFromKey(reportDateKey(fromValue, timeZone));
+  const end = reportDateFromKey(reportDateKey(toValue, timeZone));
 
   if (start && end) {
     const cursor = new Date(start.getTime());
@@ -3647,8 +5348,8 @@ function reportDaysBetween(fromValue, toValue, channels = []) {
   }
 
   for (const item of channels) {
-    const from = reportDateKey(item.from);
-    const to = reportDateKey(item.to);
+    const from = reportDateKey(item.from, timeZone);
+    const to = reportDateKey(item.to, timeZone);
     if (from) dates.add(from);
     if (to) dates.add(to);
   }
@@ -3656,20 +5357,19 @@ function reportDaysBetween(fromValue, toValue, channels = []) {
   return [...dates].sort();
 }
 
-function reportRangeOverlapsDay(fromValue, toValue, day) {
-  const start = localDateTimeMs(fromValue);
-  const end = localDateTimeMs(toValue);
-  const dayStart = localDateTimeMs(`${day}T00:00:00`);
-  const dayEnd = localDateTimeMs(`${offsetDatePart(day, 1)}T00:00:00`);
-  if (![start, end, dayStart, dayEnd].every(Number.isFinite)) return reportDateKey(fromValue) === day;
+function reportRangeOverlapsDay(fromValue, toValue, day, timeZone = configuredDisplayTimeZone()) {
+  const start = safeInstantMs(fromValue, timeZone);
+  const end = safeInstantMs(toValue, timeZone);
+  const dayStart = safeInstantMs(`${day}T00:00:00`, timeZone);
+  const dayEnd = safeInstantMs(`${offsetDatePart(day, 1)}T00:00:00`, timeZone);
+  if (![start, end, dayStart, dayEnd].every(Number.isFinite)) return reportDateKey(fromValue, timeZone) === day;
   return start < dayEnd && end > dayStart;
 }
 
-function reportDateKey(value) {
+function reportDateKey(value, timeZone = configuredDisplayTimeZone()) {
   if (!value) return '';
   try {
-    const parts = localDateParts(value);
-    return `${parts.year}-${parts.month}-${parts.day}`;
+    return zonedDatePart(zonedDateTimeToEpochMs(value, timeZone), timeZone);
   } catch {
     return '';
   }
@@ -3692,14 +5392,13 @@ function formatReportDayLabel(day) {
   });
 }
 
-function reportTimeRange(fromValue, toValue) {
-  return `${formatReportTimeOnly(fromValue)} - ${formatReportTimeOnly(toValue)}`;
+function reportTimeRange(fromValue, toValue, timeZone = configuredDisplayTimeZone()) {
+  return `${formatReportTimeOnly(fromValue, timeZone)} - ${formatReportTimeOnly(toValue, timeZone)}`;
 }
 
-function formatReportTimeOnly(value) {
+function formatReportTimeOnly(value, timeZone = configuredDisplayTimeZone()) {
   try {
-    const parts = localDateParts(value);
-    return `${parts.hour}:${parts.minute}`;
+    return localDateTimeInZone(zonedDateTimeToEpochMs(value, timeZone), timeZone).slice(11, 16);
   } catch {
     return '';
   }
@@ -4621,10 +6320,13 @@ function encodeMimeHeader(value) {
   return `=?UTF-8?B?${Buffer.from(text, 'utf8').toString('base64')}?=`;
 }
 
-function formatReportDateTime(value) {
+function formatReportDateTime(value, timeZone = configuredDisplayTimeZone(), sourceTimeZone = timeZone) {
   if (!value) return '';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('ru-RU');
+  try {
+    return formatDateTimeInZone(zonedDateTimeToEpochMs(value, sourceTimeZone), timeZone, 'ru-RU');
+  } catch {
+    return String(value);
+  }
 }
 
 function escapeHtmlText(value) {
@@ -4672,6 +6374,438 @@ function captureRtspWav(config, options, outputPath, capture) {
     signal: capture.signal,
     redactConfig: config
   });
+}
+
+async function openXmArchivePcmSession(config, params, channel, stream, capture, dependencies = {}) {
+  if (!(capture.durationSeconds > 0) || !Number.isFinite(capture.durationSeconds)) {
+    throw httpError(400, 'Progressive XM capture duration must be finite and positive.');
+  }
+  const startedAt = Date.now();
+  const fileName = params.get('fileName') || '';
+  const baseLocalBeginTime = params.get('localBeginTime') || toXmLocalTime(params.get('from') || new Date().toISOString());
+  const localBeginTime = addSecondsToLocalDateTime(baseLocalBeginTime, capture.offsetSeconds || 0, ' ');
+  const localEndTime = addSecondsToLocalDateTime(localBeginTime, capture.durationSeconds, ' ');
+  const loginStartedAt = Date.now();
+  const loginXm = dependencies.login || xmLogin;
+  const logoutXm = dependencies.logout || xmLogout;
+  const spawnProcess = dependencies.spawnProcess || spawn;
+  const openWebSocket = dependencies.openWebSocket || openXmWebSocket;
+  const sendCameraJson = dependencies.cameraJsonRequest || cameraJsonRequest;
+  const login = await loginXm(config);
+  const loginMs = Date.now() - loginStartedAt;
+  const xmChannel = Math.max(0, channel - 1);
+  const streamName = stream === 'sub' ? 'Sub' : 'Main';
+  const xmAudioCodec = normalizeXmAudioCodec(params.get('xmAudioCodec') || config.xmAudioCodec);
+  const playbackOperation = fileName ? 'StartDownLoad' : 'StartPlay';
+  const playbackMode = fileName ? 'PlayByName' : 'PlayByTime';
+  const wsPath = `/websocket-bin/Type=HttpPlayBack?Salt=${encodeURIComponent(login.salt)}&Channel=${xmChannel}&Stream=${streamName}&XMHead=1`;
+  const ffmpegArgs = [
+    '-hide_banner', '-loglevel', 'warning', '-nostdin',
+    '-f', xmAudioCodec, '-ar', '8000', '-ac', '1', '-i', 'pipe:0'
+  ];
+  addAudioFilterArgs(ffmpegArgs, capture.audioFilter);
+  ffmpegArgs.push(
+    '-ac', '1', '-ar', String(TRANSCRIPTION_PCM_SAMPLE_RATE),
+    '-acodec', 'pcm_s16le', '-f', 's16le', 'pipe:1'
+  );
+
+  let ffmpeg;
+  try {
+    ffmpeg = spawnProcess(config.ffmpegPath, ffmpegArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+  } catch (error) {
+    await logoutXm(config, login).catch(() => {});
+    throw error;
+  }
+  // ChildProcess can auto-drain stdout on exit before our caller attaches its
+  // iterator. Pipe immediately so even a fast short recording is retained.
+  const pcmOutput = new PassThrough({ highWaterMark: 64 * 1024 });
+  pcmOutput.on('error', () => {});
+  ffmpeg.stdout.pipe(pcmOutput);
+  const expectedRawBytes = Math.ceil(capture.durationSeconds * 8000);
+  const stats = {
+    loginMs,
+    firstAudioMs: 0,
+    captureMs: 0,
+    rawBytes: 0,
+    sourceSeconds: capture.durationSeconds,
+    pauseCount: 0,
+    pausedMs: 0,
+    websocketFrames: 0,
+    continuationFrames: 0
+  };
+  let wsHandle;
+  let stderr = '';
+  let commandStarted = false;
+  let settled = false;
+  let cleaned = false;
+  let idleTimer;
+  let resolveDone;
+  let rejectDone;
+  let pausedAt = 0;
+  const websocketController = new AbortController();
+  const done = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+  // A session may fail before the caller starts consuming stdout.
+  done.catch(() => {});
+
+  const idleTimeoutMs = Math.max(
+    30000,
+    Math.min(Number(config.transcriptionCaptureTimeoutMs) || 120000, 120000)
+  );
+  const touchIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      finish(httpError(504, 'Timed out while waiting for XM archive audio.', {
+        channel, localBeginTime, localEndTime, fileName,
+        receivedAudioBytes: stats.rawBytes,
+        idleTimeoutMs
+      }));
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (pausedAt) stats.pausedMs += Date.now() - pausedAt;
+    pausedAt = 0;
+    clearTimeout(idleTimer);
+    capture.signal?.removeEventListener('abort', abort);
+    websocketController.abort();
+    try { wsHandle?.destroy(); } catch {}
+    if (ffmpeg.exitCode === null && !ffmpeg.killed) ffmpeg.kill('SIGTERM');
+    await logoutXm(config, login).catch(() => {});
+  };
+  const finish = error => {
+    if (settled) return;
+    settled = true;
+    if (error) pcmOutput.destroy(error);
+    stats.captureMs = Date.now() - startedAt;
+    cleanup().finally(() => {
+      if (error) rejectDone(error);
+      else resolveDone({ ...stats });
+    });
+  };
+  const abort = () => finish(httpError(499, 'Transcription request was cancelled.'));
+  const input = createXmAudioChunkWriter(ffmpeg.stdin, capture.durationSeconds, {
+    pause: () => {
+      if (!pausedAt) {
+        pausedAt = Date.now();
+        stats.pauseCount += 1;
+      }
+      clearTimeout(idleTimer);
+      wsHandle?.pause();
+    },
+    resume: () => {
+      if (pausedAt) stats.pausedMs += Date.now() - pausedAt;
+      pausedAt = 0;
+      wsHandle?.resume();
+      touchIdleTimer();
+    },
+    stop: () => wsHandle?.destroy(),
+    onError: error => finish(httpError(502, `Archive audio pipe failed: ${publicError(error)}`, {
+      channel, localBeginTime, localEndTime, fileName, receivedAudioBytes: stats.rawBytes
+    }))
+  });
+  const audioDemuxer = createXmG711Demuxer(chunk => {
+    if (settled) return;
+    if (!stats.firstAudioMs) stats.firstAudioMs = Date.now() - startedAt;
+    touchIdleTimer();
+    input.write(chunk);
+    stats.rawBytes = input.bytesWritten;
+  });
+
+  ffmpeg.stderr.on('data', chunk => {
+    stderr = (stderr + chunk.toString('utf8')).slice(-4000);
+  });
+  ffmpeg.stderr.on('error', error => handleStreamError(error, 'xm progressive ffmpeg stderr failed', config));
+  ffmpeg.stdout.on('error', error => finish(error));
+  ffmpeg.on('error', error => finish(error));
+  ffmpeg.on('close', (code, signal) => {
+    stats.rawBytes = input.bytesWritten;
+    if (code !== 0) {
+      finish(httpError(502, `ffmpeg failed while decoding XM archive audio. ${redactSecrets(stderr, config)}`.trim(), {
+        channel, localBeginTime, localEndTime, fileName, exitCode: code, signal,
+        receivedAudioBytes: stats.rawBytes
+      }));
+      return;
+    }
+    const receivedRawSeconds = stats.rawBytes / 8000;
+    if (stats.rawBytes < expectedRawBytes
+      && !xmArchiveEndShortfallIsTolerable(capture.durationSeconds, receivedRawSeconds)) {
+      if (xmArchivePartialTailIsUsable(capture.durationSeconds, receivedRawSeconds)) {
+        stats.partial = true;
+        stats.receivedSeconds = receivedRawSeconds;
+        finish();
+        return;
+      }
+      finish(httpError(502, 'XM archive audio ended before the requested range was received.', {
+        code: 'INCOMPLETE_AUDIO', sourceGapConfirmed: false,
+        expectedDurationSeconds: capture.durationSeconds, receivedDurationSeconds: receivedRawSeconds,
+        channel, localBeginTime, localEndTime, fileName,
+        expectedAudioBytes: expectedRawBytes,
+        receivedAudioBytes: stats.rawBytes
+      }));
+      return;
+    }
+    finish();
+  });
+
+  const playbackOptions = {
+    Name: 'HttpPlayBack',
+    HttpPlayBack: {
+      Opr: playbackOperation,
+      PlayMode: playbackMode,
+      Channel: xmChannel,
+      Stream: streamName,
+      ExactSeek: 1
+    },
+    Salt: login.salt
+  };
+  if (fileName) {
+    playbackOptions.HttpPlayBack.PlayByName = { LocalTime: localBeginTime, FileName: fileName };
+  } else {
+    playbackOptions.HttpPlayBack.PlayByTime = { BeginTime: localBeginTime, EndTime: localEndTime };
+  }
+
+  if (capture.signal?.aborted) {
+    abort();
+    await done;
+  } else {
+    capture.signal?.addEventListener('abort', abort, { once: true });
+  }
+  touchIdleTimer();
+  try {
+    wsHandle = await openWebSocket(config, wsPath, {
+      signal: websocketController.signal,
+      onFrame: frame => {
+        stats.websocketFrames += 1;
+        if (frame.opcode === 0) stats.continuationFrames += 1;
+      },
+      onText: async text => {
+        if (settled) return;
+        const message = safeJsonParse(text);
+        if (message?.Ret === 100 && message.State === 'Begin' && !commandStarted) {
+          commandStarted = true;
+          const commandResult = await sendCameraJson(config, '/cgi-bin/websocket.cgi', playbackOptions);
+          if (commandResult?.Ret !== undefined && commandResult.Ret !== 100 && commandResult.Ret !== 0) {
+            finish(httpError(502, `XM transcription command failed. Ret=${commandResult.Ret}`, {
+              channel, localBeginTime, localEndTime, fileName, ret: commandResult.Ret
+            }));
+          }
+        } else if (message?.Ret !== undefined && message.Ret !== 0 && message.Ret !== 100) {
+          finish(httpError(502, `XM transcription websocket returned Ret=${message.Ret}`, {
+            channel, localBeginTime, localEndTime, fileName, ret: message.Ret
+          }));
+        }
+      },
+      onBinary: buffer => {
+        if (!settled && buffer.length) audioDemuxer.push(buffer);
+      },
+      onClose: () => {
+        audioDemuxer.flush();
+        input.end();
+      },
+      onError: error => finish(error)
+    });
+    if (settled || input.ended) wsHandle.destroy();
+    else if (input.backpressured) wsHandle.pause();
+  } catch (error) {
+    finish(error);
+    await done;
+  }
+
+  return {
+    readable: pcmOutput,
+    stats,
+    done,
+    close: async () => {
+      if (!settled) finish(httpError(499, 'Progressive XM capture was closed.'));
+      await done.catch(() => {});
+    }
+  };
+}
+
+async function uploadDriveTranscriptsRequest(req, res) {
+  requireMethod(req, 'POST');
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+    throw httpError(403, 'Ручная загрузка на Google Диск разрешена только из локального интерфейса приложения.');
+  }
+  const payload = await readJsonBody(req, 16 * 1024 * 1024);
+  const settings = await readAppSetting('ui_settings').catch(() => ({}));
+  const files = buildDriveTranscriptFiles({
+    action: payload.action || {},
+    from: payload.from,
+    to: payload.to,
+    selections: payload.selections,
+    entries: payload.entries,
+    issues: payload.issues,
+    diagnostics: payload.diagnostics,
+    failedSearches: payload.failedSearches,
+    failedRecordings: payload.failedRecordings,
+    partial: payload.partial,
+    completeness: payload.completeness,
+    complete: payload.complete,
+    settings: { ...settings, displayTimeZone: payload.timeZone || settings.displayTimeZone }
+  });
+  const result = await getGoogleDriveClient().uploadCameraTranscripts({
+    action: payload.action,
+    runKey: String(payload.runKey || `manual:${crypto.randomUUID()}`),
+    files,
+    signal: requestAbortSignal(req, res)
+  });
+  return json(res, 200, result);
+}
+
+function isLoopbackAddress(value) {
+  const address = String(value || '').trim().toLowerCase().split('%', 1)[0];
+  if (address === '::1' || address === 'localhost') return true;
+  if (address.startsWith('::ffff:')) return isLoopbackAddress(address.slice('::ffff:'.length));
+  const match = /^(\d{1,3})(?:\.(\d{1,3})){3}$/.exec(address);
+  return Boolean(match && Number(match[1]) === 127);
+}
+
+function getGoogleDriveClient() {
+  const config = readGoogleDriveConfig();
+  const signature = crypto.createHash('sha256').update(JSON.stringify([
+    config.authType, config.rootFolderId, config.clientId, config.clientSecret,
+    config.refreshToken, config.clientEmail, config.privateKey, config.tokenUri
+  ])).digest('hex');
+  if (!googleDriveClientState || googleDriveClientState.signature !== signature) {
+    googleDriveClientState = { signature, client: createGoogleDriveClient(config) };
+  }
+  return googleDriveClientState.client;
+}
+
+async function findScheduledDriveTranscripts(candidate, context = {}) {
+  const selections = (candidate.selections || []).map(selection => ({
+    ...selection,
+    label: channelLabelFromRows(context.labels, selection.channel)
+  }));
+  const files = buildDriveTranscriptFiles({
+    action: candidate.action,
+    from: candidate.from,
+    to: candidate.to,
+    selections,
+    entries: [],
+    settings: context.settings
+  });
+  return getGoogleDriveClient().findUploadedCameraTranscripts({
+    action: candidate.action,
+    runKey: candidate.runKey,
+    files,
+    signal: context.signal
+  });
+}
+
+async function uploadScheduledDriveTranscripts(candidate, transcriptResult, context = {}) {
+  assertDriveTranscriptComplete(transcriptResult);
+  const files = buildDriveTranscriptFiles({
+    action: candidate.action,
+    from: candidate.from,
+    to: candidate.to,
+    selections: candidate.selections.map(selection => ({
+      ...selection,
+      label: channelLabelFromRows(context.labels, selection.channel)
+    })),
+    entries: transcriptResult.transcriptEntries,
+    issues: transcriptResult.issues,
+    diagnostics: transcriptResult.diagnostics,
+    settings: context.settings
+  });
+  return getGoogleDriveClient().uploadCameraTranscripts({
+    action: candidate.action,
+    runKey: candidate.runKey,
+    files,
+    signal: context.signal
+  });
+}
+
+function buildDriveTranscriptFiles(payload = {}) {
+  // A marked partial report is still incomplete. Keep recovery data locally;
+  // generating an export is allowed only when no known failure remains.
+  assertDriveTranscriptComplete(payload);
+  const displayTimeZone = configuredDisplayTimeZone(payload.settings);
+  const selections = Array.isArray(payload.selections) ? payload.selections : [];
+  const entries = Array.isArray(payload.entries) ? payload.entries : [];
+  const channels = new Map();
+  for (const selection of selections) {
+    const channel = positiveInt(String(selection?.channel || ''), 0);
+    if (!channel) continue;
+    const current = channels.get(channel) || { channel, label: String(selection.label || `Канал ${channel}`).trim() || `Канал ${channel}`, selections: [] };
+    current.selections.push(selection);
+    channels.set(channel, current);
+  }
+  for (const entry of entries) {
+    const channel = positiveInt(String(entry?.channel || ''), 0);
+    if (!channel || channels.has(channel)) continue;
+    channels.set(channel, { channel, label: String(entry.label || `Канал ${channel}`).trim() || `Канал ${channel}`, selections: [] });
+  }
+  if (!channels.size) throw httpError(400, 'Для загрузки на Google Диск не выбраны камеры.');
+
+  const periodFrom = payload.from || earliestLocalDateTime(selections.map(item => item.from));
+  const periodTo = payload.to || latestLocalDateTime(selections.map(item => item.to));
+  const periodLabel = `${formatReportDateTime(periodFrom, displayTimeZone)} - ${formatReportDateTime(periodTo, displayTimeZone)}`;
+  const dateSlug = driveDateSlug(periodFrom, periodTo, displayTimeZone);
+  const actionName = safeDriveFilePart(payload.action?.name || 'Транскрибация');
+
+  return [...channels.values()].sort((left, right) => left.channel - right.channel).map(camera => {
+    const diagnostics = (payload.diagnostics || []).filter(item => Number(item.channel) === camera.channel);
+    const processedSeconds = diagnostics.reduce((sum, item) => sum + Math.max(0, Number(item.processedSeconds) || 0), 0);
+    const seen = new Set();
+    const cameraEntries = entries
+      .filter(entry => Number(entry?.channel) === camera.channel && String(entry?.text || '').trim())
+      .map(entry => {
+        const startMs = safeInstantMs(entry.start, displayTimeZone);
+        const endMs = safeInstantMs(entry.end, displayTimeZone);
+        return { ...entry, startMs, endMs, text: String(entry.text || '').trim() };
+      })
+      .sort((left, right) => (left.startMs || 0) - (right.startMs || 0))
+      .filter(entry => {
+        const key = `${entry.startMs}:${entry.endMs}:${entry.text}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    const lines = [
+      `Камера: ${String(camera.channel).padStart(2, '0')} — ${camera.label}`,
+      `Период: ${periodLabel}`,
+      `Часовой пояс: ${displayTimeZone}`,
+      `Действие: ${payload.action?.name || 'Транскрибация'}`,
+      '',
+      ...(cameraEntries.length
+        ? cameraEntries.map(entry => `[${formatReportDateTime(entry.start, displayTimeZone)}–${formatReportDateTime(entry.end, displayTimeZone)}] ${entry.text}`)
+        : ['Речь в выбранном периоде не обнаружена.'])
+    ];
+    return {
+      channel: camera.channel,
+      label: camera.label,
+      completeness: 'complete',
+      processedSeconds,
+      fileName: `${String(camera.channel).padStart(2, '0')} ${safeDriveFilePart(camera.label)} — ${dateSlug} — ${actionName}.txt`,
+      content: `\uFEFF${lines.join('\n')}\n`
+    };
+  });
+}
+
+function safeInstantMs(value, sourceTimeZone) {
+  try { return zonedDateTimeToEpochMs(value, sourceTimeZone); } catch { return Number.NaN; }
+}
+
+function driveDateSlug(from, to, timeZone) {
+  const format = value => {
+    try { return localDateTimeInZone(zonedDateTimeToEpochMs(value, timeZone), timeZone).replace('T', '_').replaceAll(':', '-'); }
+    catch { return 'period'; }
+  };
+  return `${format(from)}--${format(to)}`;
+}
+
+function safeDriveFilePart(value) {
+  return String(value || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 80) || 'Транскрибация';
 }
 
 async function captureXmArchiveWav(config, params, channel, stream, outputPath, capture) {
@@ -5356,7 +7490,7 @@ async function cameraRequest(config, pathOrUrl, options = {}) {
     baseHeaders['Content-Length'] = String(body.length);
   }
 
-  const first = await rawHttpRequest(target, {
+  const first = await cameraHttpRequest(target, {
     method,
     headers: baseHeaders,
     body,
@@ -5369,7 +7503,7 @@ async function cameraRequest(config, pathOrUrl, options = {}) {
   if (/digest/i.test(challenge)) {
     const uri = `${target.pathname}${target.search}`;
     const auth = digestHeader(challenge, method, uri, config.user, config.password);
-    return rawHttpRequest(target, {
+    return cameraHttpRequest(target, {
       method,
       headers: {
         ...baseHeaders,
@@ -5381,7 +7515,7 @@ async function cameraRequest(config, pathOrUrl, options = {}) {
   }
 
   const basic = `Basic ${Buffer.from(`${config.user}:${config.password}`).toString('base64')}`;
-  return rawHttpRequest(target, {
+  return cameraHttpRequest(target, {
     method,
     headers: {
       ...baseHeaders,
@@ -5419,6 +7553,26 @@ function cameraBaseUrl(config) {
   return `${config.scheme}://${config.host}${portPart}`;
 }
 
+async function cameraHttpRequest(target, options) {
+  try {
+    return await rawHttpRequest(target, options);
+  } catch (error) {
+    const code = error.code || error.cause?.code;
+    if (!['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EACCES'].includes(code)) throw error;
+    const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+    const address = `${target.hostname}:${port}`;
+    const message = code === 'ETIMEDOUT'
+      ? `Регистратор ${address} не ответил за ${options.timeoutMs / 1000} с (ETIMEDOUT).`
+      : `Нет связи с регистратором ${address} (${code}).`;
+    const failure = httpError(code === 'ETIMEDOUT' ? 504 : 502,
+      `${message} Проверьте доступность регистратора и локальную сеть.`, {
+        host: target.hostname, port, endpoint: target.pathname, code, timeoutMs: options.timeoutMs
+      });
+    failure.code = code;
+    throw failure;
+  }
+}
+
 function rawHttpRequest(target, options) {
   const lib = target.protocol === 'https:' ? https : http;
 
@@ -5433,6 +7587,7 @@ function rawHttpRequest(target, options) {
       response => {
         const chunks = [];
         response.on('data', chunk => chunks.push(chunk));
+        response.on('error', reject);
         response.on('end', () => {
           resolve({
             statusCode: response.statusCode || 0,
@@ -5443,7 +7598,9 @@ function rawHttpRequest(target, options) {
       }
     );
 
-    req.on('timeout', () => req.destroy(new Error(`Request timed out after ${options.timeoutMs} ms.`)));
+    req.on('timeout', () => req.destroy(Object.assign(
+      new Error(`Request timed out after ${options.timeoutMs} ms.`), { code: 'ETIMEDOUT' }
+    )));
     req.on('error', reject);
     if (options.body) req.write(options.body);
     req.end();
@@ -5453,6 +7610,7 @@ function rawHttpRequest(target, options) {
 function openXmWebSocket(config, wsPath, handlers) {
   return new Promise((resolve, reject) => {
     const key = crypto.randomBytes(16).toString('base64');
+    let settled = false;
     const request = http.request({
       host: config.host,
       port: config.httpPort || 80,
@@ -5467,15 +7625,39 @@ function openXmWebSocket(config, wsPath, handlers) {
       },
       timeout: DEFAULT_TIMEOUT_MS
     });
+    const cleanupHandshake = () => handlers.signal?.removeEventListener('abort', abort);
+    const fail = error => {
+      if (settled) return;
+      settled = true;
+      cleanupHandshake();
+      reject(error);
+    };
+    const succeed = value => {
+      if (settled) return false;
+      settled = true;
+      cleanupHandshake();
+      resolve(value);
+      return true;
+    };
+    const abort = () => {
+      const error = httpError(499, 'WebSocket connection was cancelled.');
+      request.destroy(error);
+      fail(error);
+    };
 
     request.on('upgrade', (response, socket, head) => {
+      if (settled) {
+        socket.destroy();
+        return;
+      }
       if (response.statusCode !== 101) {
         socket.destroy();
-        reject(new Error(`WebSocket upgrade failed with HTTP ${response.statusCode}`));
+        fail(new Error(`WebSocket upgrade failed with HTTP ${response.statusCode}`));
         return;
       }
 
       const parser = createWebSocketFrameParser({
+        onFrame: handlers.onFrame,
         onText: handlers.onText,
         onBinary: handlers.onBinary,
         onClose: () => {
@@ -5497,7 +7679,7 @@ function openXmWebSocket(config, wsPath, handlers) {
       socket.on('error', error => handlers.onError?.(error));
       if (head?.length) parser.push(head);
 
-      resolve({
+      const handle = {
         destroy: () => socket.destroy(),
         close: () => {
           if (!socket.destroyed) {
@@ -5507,15 +7689,21 @@ function openXmWebSocket(config, wsPath, handlers) {
         },
         pause: () => socket.pause(),
         resume: () => socket.resume()
-      });
+      };
+      if (!succeed(handle)) socket.destroy();
     });
 
     request.on('response', response => {
       response.resume();
-      reject(new Error(`WebSocket upgrade failed with HTTP ${response.statusCode}`));
+      fail(new Error(`WebSocket upgrade failed with HTTP ${response.statusCode}`));
     });
     request.on('timeout', () => request.destroy(new Error('WebSocket upgrade timed out.')));
-    request.on('error', reject);
+    request.on('error', fail);
+    if (handlers.signal?.aborted) {
+      abort();
+      return;
+    }
+    handlers.signal?.addEventListener('abort', abort, { once: true });
     request.end();
   });
 }
@@ -5560,6 +7748,7 @@ function createWebSocketFrameParser(handlers) {
 
         let payload = buffer.subarray(offset, offset + length);
         buffer = buffer.subarray(offset + length);
+        handlers.onFrame?.({ opcode, final: Boolean(first & 0x80), length });
 
         if (masked) {
           payload = Buffer.from(payload);
@@ -5584,22 +7773,42 @@ function createWebSocketFrameParser(handlers) {
 }
 
 function createXmG711Demuxer(onAudio) {
-  const audioHeader = Buffer.from([0x00, 0x00, 0x01, 0xfa, 0x0a, 0x02, 0x80, 0x02]);
-  const payloadLength = 640;
+  const audioHeaderPrefix = Buffer.from([0x00, 0x00, 0x01, 0xfa, 0x0a, 0x02]);
+  const audioHeaderLength = 8;
+  const minPayloadLength = 80;
+  const maxPayloadLength = 1280;
+  const payloadAlignment = 80;
   let buffer = Buffer.alloc(0);
 
   return {
     push(chunk) {
-      buffer = Buffer.concat([buffer, chunk]);
+      const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk || []);
+      if (!incoming.length) return;
+      buffer = buffer.length ? Buffer.concat([buffer, incoming]) : incoming;
 
-      while (buffer.length >= audioHeader.length) {
-        const index = buffer.indexOf(audioHeader);
+      while (buffer.length >= audioHeaderPrefix.length) {
+        const index = buffer.indexOf(audioHeaderPrefix);
         if (index === -1) {
-          buffer = buffer.subarray(Math.max(0, buffer.length - audioHeader.length + 1));
+          buffer = buffer.subarray(Math.max(0, buffer.length - audioHeaderPrefix.length + 1));
           return;
         }
 
-        const payloadStart = index + audioHeader.length;
+        if (buffer.length < index + audioHeaderLength) {
+          buffer = buffer.subarray(index);
+          return;
+        }
+
+        const payloadLength = buffer.readUInt16LE(index + audioHeaderPrefix.length);
+        if (payloadLength < minPayloadLength
+          || payloadLength > maxPayloadLength
+          || payloadLength % payloadAlignment !== 0) {
+          // A matching byte sequence inside video data must not pin an
+          // unbounded buffer or hide the next real XM audio frame.
+          buffer = buffer.subarray(index + 1);
+          continue;
+        }
+
+        const payloadStart = index + audioHeaderLength;
         const payloadEnd = payloadStart + payloadLength;
         if (buffer.length < payloadEnd) {
           buffer = buffer.subarray(index);
@@ -6214,6 +8423,13 @@ function transcriptCacheKey(config, params, values) {
     durationSeconds: values.durationSeconds,
     offsetSeconds: values.offsetSeconds || 0
   };
+  if (values.pipeline) keyData.pipeline = String(values.pipeline);
+  if (Number.isFinite(Number(values.anchorOffsetSeconds))) {
+    keyData.anchorOffsetSeconds = Number(values.anchorOffsetSeconds);
+  }
+  if (Number.isFinite(Number(values.sessionEndOffsetSeconds))) {
+    keyData.sessionEndOffsetSeconds = Number(values.sessionEndOffsetSeconds);
+  }
 
   return crypto.createHash('sha1').update(JSON.stringify(keyData)).digest('hex');
 }
@@ -6500,17 +8716,29 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-function checkFfmpeg(command = cameraConfig().ffmpegPath) {
-  return new Promise(resolve => {
+function checkFfmpeg(command = cameraConfig().ffmpegPath, options = {}) {
+  const cacheKey = String(command || 'ffmpeg');
+  if (!options.bypassCache && ffmpegCheckCache.has(cacheKey)) {
+    return ffmpegCheckCache.get(cacheKey);
+  }
+
+  const spawnProcess = options.spawnProcess || spawn;
+  const check = new Promise(resolve => {
     let child;
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
 
     try {
-      child = spawn(command, ['-version'], {
+      child = spawnProcess(command, ['-version'], {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true
       });
     } catch (error) {
-      resolve({
+      finish({
         available: false,
         command,
         error: error.message
@@ -6524,7 +8752,7 @@ function checkFfmpeg(command = cameraConfig().ffmpegPath) {
     });
 
     child.on('error', error => {
-      resolve({
+      finish({
         available: false,
         command,
         error: error.message
@@ -6532,7 +8760,7 @@ function checkFfmpeg(command = cameraConfig().ffmpegPath) {
     });
 
     child.on('close', code => {
-      resolve({
+      finish({
         available: code === 0,
         command,
         code,
@@ -6540,6 +8768,23 @@ function checkFfmpeg(command = cameraConfig().ffmpegPath) {
       });
     });
   });
+
+  if (!options.bypassCache) {
+    ffmpegCheckCache.set(cacheKey, check);
+    check.then(result => {
+      // A missing binary may be installed while the server is running, so only
+      // successful checks live for the lifetime of the process.
+      if (!result.available && ffmpegCheckCache.get(cacheKey) === check) {
+        ffmpegCheckCache.delete(cacheKey);
+      }
+    });
+  }
+  return check;
+}
+
+function clearFfmpegCheckCache(command = '') {
+  if (command) ffmpegCheckCache.delete(String(command));
+  else ffmpegCheckCache.clear();
 }
 
 function transcriptionRuntimeStatus(runtime, worker, modelError = '') {
@@ -6833,10 +9078,17 @@ function isExpectedDisconnect(error) {
 }
 
 export {
+  oneTimeDriveCandidate,
+  searchXmRecordings,
+  writePcm16Wav,
+  cameraRequest,
+  searchScheduledRecordings,
   transcriptCacheKey,
   runTranscriptionSetup,
   transcriptionPreparationPending,
   transcriptionRuntimeStatus,
+  xmArchiveEndShortfallIsTolerable,
+  xmArchivePartialTailIsUsable,
   checkTranscriber,
   createOpenAiResponse,
   resolveOpenAiProxyUrl,
@@ -6849,14 +9101,25 @@ export {
   localJsonApi,
   actionLastRunMatchesCandidate,
   buildScheduledActionTranscript,
+  buildDriveTranscriptFiles,
   buildReportDocxAttachment,
+  checkFfmpeg,
+  chunkFixedPcm,
+  clearFfmpegCheckCache,
+  createXmG711Demuxer,
   createXmAudioChunkWriter,
   isWeekendDatePart,
+  isLoopbackAddress,
   markActionSchedulerState,
   normalizeStoredAction,
+  normalizeRecordingSearchTimeRange,
+  publicGoogleDriveConfig,
+  openXmArchivePcmSession,
+  openXmWebSocket,
   reportMessageId,
   resolveScheduledDailyDate,
   resolveScheduledWeeklyDates,
+  restoreExplicitStoppedCandidate,
   scheduledActionConfigHash,
   scheduledActionCandidates,
   scheduledReportTypes,
@@ -6864,7 +9127,11 @@ export {
   sendScheduledActionErrorEmail,
   scheduledRetryCandidates,
   scheduledRetryDelayMs,
+  scheduledAvailabilityRetry,
+  scheduledIncompleteAudioRetry,
+  scheduledProcessingNoProgressRetry,
   shouldRunScheduledCandidate,
   transcribeScheduledRecording,
+  transcribeXmRecoveryBlock,
   transcriptionDurationSeconds
 };

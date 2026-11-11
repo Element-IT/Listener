@@ -10,7 +10,10 @@ const {
   shouldRunScheduledCandidate, runScheduledOpenAiAction, stopScheduledOpenAiAction, localJsonApi
 } = await import('../server.mjs');
 
-const group = { id: 'g', name: 'Group 3', channels: [2], from: '2026-09-08T08:37', to: '2026-09-08T08:40' };
+const group = {
+  id: 'g', name: 'Group 3', channels: [2],
+  from: '2026-09-08T08:37', to: '2026-09-08T08:40', timeZone: 'Asia/Yekaterinburg'
+};
 const groupMap = new Map([[group.id, group]]);
 const action = {
   id: 'a', name: 'Test', question: 'What happened?', groupIds: ['g'], periodMode: 'daily',

@@ -9,6 +9,7 @@ const {
   normalizeStoredAction,
   reportMessageId,
   resolveScheduledDailyDate,
+  restoreExplicitStoppedCandidate,
   scheduledActionConfigHash,
   scheduledActionCandidates,
   scheduledReportTypes,
@@ -176,6 +177,28 @@ test('сохранённая ошибка остаётся кандидатом 
   assert.equal(retries.length, 1);
   assert.equal(retries[0].runKey, candidate.runKey);
   assert.equal(shouldRunScheduledCandidate(state.actions[candidate.action.id].daily, retries[0], sunday), true);
+});
+
+test('явный запуск восстанавливает остановленный период после смены даты', () => {
+  const monday = localDate(2026, 9, 21, 18);
+  const candidate = scheduledActionCandidates(action({ reportWeekly: false }), groupMap, monday)
+    .find(item => item.periodMode === 'daily');
+  const stoppedAction = {
+    ...candidate.action,
+    lastRun: {
+      status: 'stopped',
+      runKey: candidate.runKey,
+      from: candidate.from,
+      to: candidate.to,
+      dueAt: candidate.dueAt
+    }
+  };
+
+  const restored = restoreExplicitStoppedCandidate(stoppedAction, [group], {});
+  assert.ok(restored);
+  assert.equal(restored.runKey, candidate.runKey);
+  assert.equal(restored.from, candidate.from);
+  assert.equal(restored.to, candidate.to);
 });
 
 test('явный ручной запуск может вернуть в очередь просроченную ошибку', () => {

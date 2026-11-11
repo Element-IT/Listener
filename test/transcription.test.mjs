@@ -6,6 +6,8 @@ import { Writable } from 'node:stream';
 import test from 'node:test';
 
 process.env.TZ = 'Asia/Yekaterinburg';
+process.env.CAMERA_TIME_ZONE = 'Asia/Yekaterinburg';
+process.env.DISPLAY_TIME_ZONE = 'Asia/Yekaterinburg';
 process.env.TRANSCRIPTION_CAPTURE_CHUNK_SECONDS = '30';
 
 const {
@@ -113,8 +115,10 @@ test('partial recording failures remain available for email while other recordin
   assert.equal(result.completedRecordings, 1);
   assert.equal(result.failedRecordings, 1);
   assert.equal(result.contextLines.length, 1);
-  assert.equal(result.issues[0].fileName, 'bad.h264');
-  assert.equal(result.issues[0].error, 'ffmpeg failed');
+  const failedRecording = result.issues.find(issue => issue.stage === 'transcript');
+  assert.equal(failedRecording.fileName, 'bad.h264');
+  assert.equal(failedRecording.error, 'ffmpeg failed');
+  assert.ok(result.issues.some(issue => issue.code === 'ARCHIVE_GAPS'));
 });
 
 test('complete transcription failures retain the correct stage and low-level error', async () => {

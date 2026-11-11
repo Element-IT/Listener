@@ -34,6 +34,7 @@
         <nav class="tab-nav" aria-label="Разделы">
           <button id="audioTabButton" class="tab-button active" type="button" data-tab="audio" aria-controls="audioTab" aria-selected="true">Прослушивание</button>
           <button id="openAiTabButton" class="tab-button secondary" type="button" data-tab="openai" aria-controls="openAiTab" aria-selected="false">Действия OpenAI</button>
+          <button id="audioFilesTabButton" class="tab-button secondary" type="button" data-tab="audio-files" aria-controls="audioFilesTab" aria-selected="false">Аудиофайлы</button>
         </nav>
 
         <div id="audioTab" class="tab-page active" data-tab-panel="audio">
@@ -108,6 +109,50 @@
                 </tbody>
               </table>
             </div>
+          </section>
+        </div>
+
+        <div id="audioFilesTab" class="tab-page" data-tab-panel="audio-files" hidden>
+          <section class="panel audio-files-panel" aria-labelledby="audioFilesTitle">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Транскрибация файлов</p>
+                <h3 id="audioFilesTitle">Аудиофайлы → единый TXT</h3>
+                <p id="audioFilesModel" class="muted-line">Модель из настроек: загрузка…</p>
+              </div>
+              <span id="audioFilesStatus" class="section-status neutral" role="status">Выберите файлы</span>
+            </div>
+
+            <label id="audioFilesDropZone" class="audio-files-drop-zone" for="audioFilesInput">
+              <strong>Выберите несколько аудиофайлов или перетащите их сюда</strong>
+              <span>MP3, WAV, M4A, AAC, OGG, OPUS, FLAC, WMA, AIF/AIFF, AMR, 3GP, MP4, WEBM, MKA, AC3. До 2 ГБ на файл.</span>
+              <input id="audioFilesInput" type="file" multiple accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,.flac,.wma,.aif,.aiff,.amr,.3gp,.mp4,.webm,.mka,.ac3" aria-describedby="audioFilesTimingHint">
+            </label>
+            <p id="audioFilesTimingHint" class="muted-line audio-files-hint">Дата и время начала берутся из конца названия: 1-recording-20261009-142239 → 09.10.2026 14:22:39. Если шаблон не найден, тайминги начинаются с 00:00:00.</p>
+            <p id="audioFilesTimeZone" class="muted-line audio-files-hint"></p>
+            <ul id="audioFilesList" class="audio-files-list" aria-label="Выбранные аудиофайлы"></ul>
+            <div class="openai-actions audio-files-actions">
+              <button id="audioFilesStartButton" type="button" disabled>Транскрибировать</button>
+              <button id="audioFilesStopButton" class="secondary" type="button" disabled>Стоп</button>
+              <button id="audioFilesClearButton" class="secondary" type="button" disabled>Очистить</button>
+              <a id="audioFilesDownload" class="audio-files-download" download="Транскрипция.txt" hidden>Скачать единый TXT</a>
+            </div>
+            <div id="audioFilesError" class="openai-error" role="alert" hidden></div>
+            <div id="audioFilesProgressPanel" class="audio-files-progress" hidden>
+              <div class="openai-progress-head">
+                <span id="audioFilesProgressLabel" role="status" aria-live="polite">Ожидает</span>
+                <span id="audioFilesProgressCount">0/0</span>
+              </div>
+              <progress id="audioFilesProgress" value="0" max="1" aria-label="Обработано файлов"></progress>
+            </div>
+            <div class="transcript-panel archive-transcript">
+              <div class="transcript-heading">
+                <span>Текст по мере распознавания</span>
+                <span id="audioFilesTranscriptStatus">Нет текста</span>
+              </div>
+              <div id="audioFilesTranscript" class="transcript-text audio-files-transcript is-empty">Нет текста</div>
+            </div>
+            <p class="muted-line audio-files-hint">Файлы обрабатываются последовательно. Оставьте эту страницу открытой до завершения; готовые части можно скачать сразу. Файлы с датами будут объединены по времени, остальные — в порядке выбора.</p>
           </section>
         </div>
 
@@ -233,7 +278,7 @@
 
             <div class="transcript-panel archive-transcript openai-answer-panel" aria-live="polite">
               <div class="transcript-heading">
-                <span>Ответ ChatGPT</span>
+                <span id="openAiAnswerTitle">Ответ ChatGPT</span>
                 <span id="openAiAnswerStatus">Ожидает</span>
               </div>
               <div id="openAiAnswer" class="transcript-text openai-answer is-empty">Нет ответа</div>
@@ -262,7 +307,17 @@
             <div id="actionGroupList" class="action-group-list"></div>
           </fieldset>
 
-          <label class="question-field">
+          <label>
+            Результат действия
+            <select id="actionDestination">
+              <option value="email">Отправить отчёт на почту</option>
+              <option value="drive">Загрузить транскрипцию на Google Диск</option>
+            </select>
+          </label>
+
+          <p id="actionDestinationHint" class="muted-line">OpenAI подготовит отчёт и отправит его на указанные почты.</p>
+
+          <label id="actionQuestionField" class="question-field">
             Вопрос
             <textarea id="actionQuestion" rows="4" placeholder="О чём говорили сотрудники?"></textarea>
           </label>
@@ -386,6 +441,29 @@
             Почты для отчётов
             <textarea id="reportEmails" rows="3" placeholder="manager@example.com, security@example.com"></textarea>
           </label>
+          <label>
+            Часовой пояс камер
+            <select id="cameraTimeZone">
+              <option value="Europe/Moscow">Москва (UTC+3)</option>
+            </select>
+          </label>
+          <label>
+            Ваш часовой пояс
+            <select id="displayTimeZone">
+              <option value="Europe/Kaliningrad">Калининград (UTC+2)</option>
+              <option value="Europe/Moscow">Москва (UTC+3)</option>
+              <option value="Europe/Samara">Самара (UTC+4)</option>
+              <option value="Asia/Yekaterinburg">Екатеринбург (UTC+5)</option>
+              <option value="Asia/Omsk">Омск (UTC+6)</option>
+              <option value="Asia/Novosibirsk">Новосибирск (UTC+7)</option>
+              <option value="Asia/Irkutsk">Иркутск (UTC+8)</option>
+              <option value="Asia/Yakutsk">Якутск (UTC+9)</option>
+              <option value="Asia/Vladivostok">Владивосток (UTC+10)</option>
+              <option value="Asia/Magadan">Магадан (UTC+11)</option>
+              <option value="Asia/Kamchatka">Камчатка (UTC+12)</option>
+            </select>
+          </label>
+          <p class="muted-line">Вы выбираете и видите время в своём часовом поясе. Перед запросом к камерам оно автоматически переводится в московское.</p>
           <button id="probeButton" type="button">Проверить API</button>
           <div id="settingsSummary" class="settings-summary">Загрузка</div>
         </section>

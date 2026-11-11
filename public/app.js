@@ -1,5 +1,9 @@
+import { initAudioFilesTab } from './audio-files.js';
+
 const CHANNEL_COUNT = 16;
 const DEFAULT_TRANSCRIPT_SECONDS = 18;
+const DEFAULT_CAMERA_TIME_ZONE = 'Europe/Moscow';
+const DEFAULT_DISPLAY_TIME_ZONE = 'Asia/Yekaterinburg';
 const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 4;
 const OPENAI_STAGE_ORDER = ['search', 'transcribe', 'ask', 'report'];
 const OPENAI_STAGE_LABELS = {
@@ -11,6 +15,9 @@ const OPENAI_STAGE_LABELS = {
   stopping: 'Останавливается',
   ask: 'Запрос OpenAI',
   report: 'Отправка отчёта',
+  drive: 'Загрузка на Google Диск',
+  localstorage: 'Сохранение готового результата на компьютере',
+  delivery_pending: 'Ожидает отправки на Google Диск',
   done: 'Готово',
   error: 'Ошибка'
 };
@@ -46,6 +53,7 @@ const elements = {
   settingsDrawer: document.querySelector('#settingsDrawer'),
   audioTabButton: document.querySelector('#audioTabButton'),
   openAiTabButton: document.querySelector('#openAiTabButton'),
+  audioFilesTabButton: document.querySelector('#audioFilesTabButton'),
   audioTab: document.querySelector('#audioTab'),
   openAiTab: document.querySelector('#openAiTab'),
   vendor: document.querySelector('#vendor'),
@@ -53,6 +61,8 @@ const elements = {
   audioFilter: document.querySelector('#audioFilter'),
   transcriptSeconds: document.querySelector('#transcriptSeconds'),
   reportEmails: document.querySelector('#reportEmails'),
+  cameraTimeZone: document.querySelector('#cameraTimeZone'),
+  displayTimeZone: document.querySelector('#displayTimeZone'),
   probeButton: document.querySelector('#probeButton'),
   startLiveButton: document.querySelector('#startLiveButton'),
   stopLiveButton: document.querySelector('#stopLiveButton'),
@@ -88,6 +98,9 @@ const elements = {
   actionName: document.querySelector('#actionName'),
   actionGroupList: document.querySelector('#actionGroupList'),
   actionQuestion: document.querySelector('#actionQuestion'),
+  actionQuestionField: document.querySelector('#actionQuestionField'),
+  actionDestination: document.querySelector('#actionDestination'),
+  actionDestinationHint: document.querySelector('#actionDestinationHint'),
   actionPeriodMode: document.querySelector('#actionPeriodMode'),
   actionDayPreset: document.querySelector('#actionDayPreset'),
   actionDayPresetLabel: document.querySelector('#actionDayPresetLabel'),
@@ -111,6 +124,7 @@ const elements = {
   openAiRunLog: document.querySelector('#openAiRunLog'),
   openAiTranscript: document.querySelector('#openAiTranscript'),
   openAiTranscriptStatus: document.querySelector('#openAiTranscriptStatus'),
+  openAiAnswerTitle: document.querySelector('#openAiAnswerTitle'),
   openAiAnswer: document.querySelector('#openAiAnswer'),
   openAiAnswerStatus: document.querySelector('#openAiAnswerStatus'),
   log: document.querySelector('#log')
@@ -148,6 +162,10 @@ const pendingActionCommands = new Map();
 let schedulerState = null;
 let schedulerClockOffset = 0;
 let actionStateRefreshing = false;
+const audioFilesTab = initAudioFilesTab({
+  getSettings: () => ({ audioFilter: elements.audioFilter.value || 'voice', timeZone: displayTimeZone() }),
+  getModel: () => transcriptionModelState
+});
 
 applySettingsToControls();
 renderChannelButtons();
@@ -191,6 +209,7 @@ elements.channelNameFields.addEventListener('input', event => {
 
 elements.audioTabButton.addEventListener('click', () => switchTab('audio'));
 elements.openAiTabButton.addEventListener('click', () => switchTab('openai'));
+elements.audioFilesTabButton.addEventListener('click', () => switchTab('audio-files'));
 elements.settingsButton.addEventListener('click', openSettings);
 elements.settingsCloseButton.addEventListener('click', closeSettings);
 elements.settingsBackdrop.addEventListener('click', closeSettings);
@@ -225,6 +244,9 @@ elements.reportEmails.addEventListener('change', () => {
   saveUiSettings();
   log({ ok: true, reportEmails: reportEmailList().length });
 });
+
+elements.cameraTimeZone.addEventListener('change', handleTimeZoneChanged);
+elements.displayTimeZone.addEventListener('change', handleTimeZoneChanged);
 
 elements.archiveAudio.addEventListener('error', () => {
   log({
@@ -287,6 +309,7 @@ elements.cancelActionButton.addEventListener('click', closeActionDialog);
 elements.saveActionButton.addEventListener('click', saveActionFromDialog);
 elements.actionPeriodMode.addEventListener('change', updateActionPeriodModeUi);
 elements.actionDayPreset.addEventListener('change', updateActionPeriodModeUi);
+elements.actionDestination.addEventListener('change', updateActionPeriodModeUi);
 elements.openAiCancelButton.addEventListener('click', stopOpenAiWorkflow);
 
 function selectChannel(channel, options = {}) {
@@ -359,7 +382,9 @@ function renderOpenAiGroups() {
     return;
   }
 
-  elements.openAiGroupList.innerHTML = openAiGroups.map(group => `
+  elements.openAiGroupList.innerHTML = openAiGroups.map(group => {
+    const displayRange = groupRangeInDisplayTimeZone(group);
+    return `
     <article class="group-card">
       <div class="card-title-row">
         <div>
@@ -368,13 +393,14 @@ function renderOpenAiGroups() {
         </div>
       </div>
       <div class="meta-line">${escapeHtml(group.channels.map(channel => `${String(channel).padStart(2, '0')} ${channelLabel(channel)}`).join(', '))}</div>
-      <div class="meta-line">${escapeHtml(formatTime(group.from))} - ${escapeHtml(formatTime(group.to))}</div>
+      <div class="meta-line">${escapeHtml(formatTime(displayRange.from))} - ${escapeHtml(formatTime(displayRange.to))}</div>
       <div class="card-actions">
         <button class="inline file" type="button" data-group-action="edit" data-group-id="${escapeHtml(group.id)}">Изменить</button>
         <button class="inline danger" type="button" data-group-action="delete" data-group-id="${escapeHtml(group.id)}">Удалить</button>
       </div>
     </article>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function renderOpenAiActions() {
@@ -383,6 +409,10 @@ function renderOpenAiActions() {
     return;
   }
 
+  const expandedDiagnostics = new Set(Array.from(
+    elements.openAiActionList.querySelectorAll('details[data-action-diagnostics][open]'),
+    element => element.dataset.actionDiagnostics
+  ));
   elements.openAiActionList.innerHTML = openAiActions.map(action => {
     const schedule = schedulerState?.schedules?.[action.id];
     const run = schedule?.run || action.lastRun || {};
@@ -400,12 +430,13 @@ function renderOpenAiActions() {
         ? ' running'
         : run.status === 'success'
         ? ' success'
-        : run.status === 'error' || run.status === 'delivery_uncertain'
+        : ['error', 'delivery_uncertain', 'incomplete'].includes(run.status)
           ? ' error'
           : '';
     const groups = action.groupIds.map(groupId => groupById(groupId)?.name).filter(Boolean);
     const subtitle = actionPeriodSubtitle(action);
     const reports = actionReportLabels(action);
+    const destination = action.destination === 'drive' ? 'Google Диск · TXT по камерам' : 'Почта · отчёт OpenAI';
     const weekendMode = action.runOnWeekends ? 'обрабатывать' : 'пропускать';
     const triggerNotice = actionRunNotices.get(action.id);
     const runSource = run.scheduled ? 'Авто · ' : '';
@@ -414,9 +445,9 @@ function renderOpenAiActions() {
       : activeOpenAiActionId === action.id
       ? 'Выполняется вручную'
       : run.status && !['running', 'queued'].includes(run.status)
-        ? `${runSource}${run.status === 'success' ? 'Готово' : run.status === 'running' ? 'Выполняется' : run.status === 'queued' ? 'В очереди' : run.status === 'stopped' ? 'Остановлено' : run.status === 'delivery_uncertain' ? 'Доставка не подтверждена' : 'Ошибка'}${run.at ? ` · ${formatTime(run.at)}` : ''}`
+        ? `${runSource}${run.status === 'success' ? 'Готово' : run.status === 'running' ? 'Выполняется' : run.status === 'queued' ? 'В очереди' : run.status === 'stopped' ? 'Остановлено' : run.status === 'delivery_uncertain' ? 'Доставка не подтверждена' : run.status === 'delivery_pending' ? 'Транскрибация готова — ожидает отправки' : run.status === 'incomplete' ? 'Требует внимания' : 'Ошибка'}${run.at ? ` · ${formatTime(run.at)}` : ''}`
         : 'Ожидает запуска';
-    const errorLine = !busy && (run.status === 'error' || run.status === 'delivery_uncertain')
+    const errorLine = !busy && ['error', 'delivery_uncertain', 'incomplete'].includes(run.status)
       ? `${OPENAI_STAGE_LABELS[run.stage] || run.stage || 'Выполнение'}: ${run.error || 'без деталей'}`
       : '';
 
@@ -430,12 +461,16 @@ function renderOpenAiActions() {
           <span class="action-state">${escapeHtml(lastLine)}</span>
         </div>
         <div class="meta-line">Группы: ${escapeHtml(groups.length ? groups.join(', ') : 'не найдены')}</div>
-        <div class="meta-line action-last-start">Последний старт: ${lastStartedAt ? `<time datetime="${escapeHtml(lastStartedAt)}">${escapeHtml(formatScheduledTime(lastStartedAt))}</time> (ЕКБ)` : run.status ? 'время не сохранено' : 'ещё не запускалось'}</div>
+        <div class="meta-line action-last-start">Последний старт: ${lastStartedAt ? `<time datetime="${escapeHtml(lastStartedAt)}">${escapeHtml(formatScheduledTime(lastStartedAt))}</time> (${escapeHtml(displayTimeZoneLabel())})` : run.status ? 'время не сохранено' : 'ещё не запускалось'}</div>
+        ${run.from && run.to ? `<div class="meta-line">Период обработки: ${escapeHtml(formatScheduledTime(run.from))} — ${escapeHtml(formatScheduledTime(run.to))} (${escapeHtml(displayTimeZoneLabel())})</div>` : ''}
+        <div class="meta-line">Результат: ${escapeHtml(destination)}</div>
         ${action.periodMode !== 'once' ? `<div class="meta-line">Выходные: ${weekendMode}</div>` : ''}
         ${reports.length ? `<div class="meta-line">Отчёты: ${escapeHtml(reports.join(', '))}</div>` : ''}
         <div class="action-countdown meta-line" data-action-countdown="${escapeHtml(action.id)}"></div>
         ${triggerNotice ? `<div class="meta-line${triggerNotice.error ? ' action-error-line' : ''}">${escapeHtml(triggerNotice.message)}</div>` : ''}
-        ${errorLine ? `<div class="meta-line action-error-line">Ошибка: ${escapeHtml(errorLine)}</div>` : ''}
+        ${errorLine ? `<div class="meta-line action-error-line">${run.status === 'incomplete' ? 'Причина' : 'Ошибка'}: ${escapeHtml(errorLine)}</div>` : ''}
+        ${!busy && run.status === 'incomplete' ? `<div class="meta-line">Автоповторы этого периода остановлены.${action.periodMode !== 'once' ? ' Следующие периоды обрабатываются по расписанию.' : ''} Повторить этот период можно вручную кнопкой «Запустить».</div>` : ''}
+        ${!busy && Number(run.missingAudioRecordings) > 0 ? `<div class="meta-line">Без аудиодорожки: ${Number(run.missingAudioRecordings)} ${pluralRu(Number(run.missingAudioRecordings), 'запись', 'записи', 'записей')}; интервалы отмечены в TXT.</div>` : ''}
         ${background ? `
           <div class="action-background-progress">
             <div class="action-progress-heading">
@@ -449,7 +484,13 @@ function renderOpenAiActions() {
           </div>` : ''}
         ${run.errorNotification?.status === 'sent' ? '<div class="meta-line">Уведомление об ошибке отправлено на почту</div>' : ''}
         ${run.errorNotification && run.errorNotification.status !== 'sent' ? `<div class="meta-line action-error-line">Уведомление об ошибке: ${escapeHtml(run.errorNotification.error || run.errorNotification.reason || 'доставка не подтверждена')}</div>` : ''}
-        <div class="meta-line">Вопрос: ${escapeHtml(action.question)}</div>
+        ${action.destination === 'drive' && run.status ? `<div class="meta-line">Файлов сохранено на Google Диске: ${driveUploadsSummary(run.uploads)}</div>` : ''}
+        ${action.destination === 'drive' ? renderDriveDeliveryStatus(run) : ''}
+        ${Array.isArray(run.uploads) && run.uploads.length ? `<div class="meta-line">Google Диск: ${run.uploads.map(upload => upload.webViewLink
+          ? `<a href="${escapeHtml(upload.webViewLink)}" target="_blank" rel="noopener noreferrer">${escapeHtml(driveUploadLabel(upload))}</a>`
+          : escapeHtml(driveUploadLabel(upload))).join(', ')}</div>` : ''}
+        ${renderActionDiagnostics(action.id, run.diagnostics, expandedDiagnostics.has(action.id))}
+        ${action.destination === 'email' ? `<div class="meta-line">Вопрос: ${escapeHtml(action.question)}</div>` : ''}
         <div class="card-actions">
           ${busy ? `<button class="inline danger" type="button" data-action-command="stop" data-action-id="${escapeHtml(action.id)}" ${stopping || pendingActionCommands.get(action.id) === 'run' ? 'disabled' : ''}>${stopping ? 'Останавливается…' : 'Остановить'}</button>` : `
           <button class="inline" type="button" data-action-command="run" data-action-id="${escapeHtml(action.id)}">Запустить</button>
@@ -461,6 +502,69 @@ function renderOpenAiActions() {
     `;
   }).join('');
   updateActionCountdowns();
+}
+
+function driveUploadsSummary(uploads) {
+  const saved = Array.isArray(uploads) ? uploads : [];
+  const partial = saved.filter(upload => upload.completeness === 'partial').length;
+  return `${saved.length} (полных: ${saved.length - partial}, неполных: ${partial})`;
+}
+
+function renderDriveDeliveryStatus(run = {}) {
+  const count = value => Math.max(0, Math.floor(Number(value) || 0));
+  const localReady = count(run.progress?.readyCameras ?? run.localReadyCameras);
+  const queued = count(run.queuedCameras ?? run.progress?.queuedCameras);
+  const pending = run.status === 'delivery_pending';
+  if (!localReady && !queued && !pending) return '';
+  const deliveryError = run.deliveryError || (pending ? run.error : '');
+  return `
+    <div class="meta-line">Готовых файлов на компьютере: ${localReady} · Ожидают отправки: ${queued}</div>
+    ${pending ? '<div class="meta-line">Транскрибация завершена. Готовые TXT сохранены на компьютере; отправка на Google Диск повторяется отдельно, без повторной обработки камер.</div>' : ''}
+    ${deliveryError ? `<div class="meta-line action-error-line">Отправка отложена: ${escapeHtml(deliveryError)}</div>` : ''}`;
+}
+
+function driveUploadLabel(upload) {
+  const label = String(upload.fileName || `камера ${upload.channel}`);
+  return upload.completeness === 'partial' && !label.toLocaleUpperCase('ru-RU').includes('НЕПОЛНАЯ ТРАНСКРИБАЦИЯ')
+    ? `НЕПОЛНАЯ ТРАНСКРИБАЦИЯ · ${label}`
+    : label;
+}
+
+function renderActionDiagnostics(actionId, diagnostics, expanded = false) {
+  if (!Array.isArray(diagnostics) || !diagnostics.length) return '';
+  const statusLabels = {
+    skipped: 'Уже сохранено — пропущено', complete: 'Обработано',
+    incomplete: 'Обработано не полностью', search: 'Поиск записей', transcript: 'Транскрибация'
+  };
+  const nonnegativeNumber = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+  const count = value => Math.floor(nonnegativeNumber(value)).toLocaleString('ru-RU');
+  const elapsed = value => `${(nonnegativeNumber(value) / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} с`;
+  const duration = value => formatDurationLabel(nonnegativeNumber(value));
+  const range = value => value?.from && value?.to
+    ? `${formatScheduledTime(value.from)} — ${formatScheduledTime(value.to)}` : '';
+  return `
+    <details class="meta-line" data-action-diagnostics="${escapeHtml(actionId)}"${expanded ? ' open' : ''}>
+      <summary>Диагностика по камерам (${diagnostics.length})</summary>
+      <div class="meta-line">Время: ${escapeHtml(displayTimeZoneLabel())}. Длительность аудио указана в минутах и секундах.</div>
+      ${diagnostics.map(item => {
+        const diagnostic = item && typeof item === 'object' ? item : {};
+        const coverage = diagnostic.archiveCoverage;
+        const issues = Array.isArray(diagnostic.issues) ? diagnostic.issues : [];
+        const gaps = Array.isArray(coverage?.gaps) ? coverage.gaps : [];
+        return `
+          <div class="group-card">
+            <strong>${escapeHtml(`${String(Math.floor(nonnegativeNumber(diagnostic.channel))).padStart(2, '0')} · ${diagnostic.label || 'Камера'}`)}</strong>
+            <div class="meta-line">${escapeHtml(statusLabels[diagnostic.status] || diagnostic.status || 'Нет данных')}</div>
+            ${range(diagnostic) ? `<div class="meta-line">${escapeHtml(range(diagnostic))}</div>` : ''}
+            ${diagnostic.status === 'skipped' ? '<div class="meta-line">Готовый результат уже сохранён локально или на Google Диске. Повторная загрузка записей и транскрибация не выполнялись.</div>' : `
+              <div class="meta-line">Записей обработано: ${escapeHtml(count(diagnostic.completedRecordings))}/${escapeHtml(count(diagnostic.recordings))} · Аудио: ${escapeHtml(duration(diagnostic.processedSeconds))} · Частей из кэша: ${escapeHtml(count(diagnostic.cachedChunks))}</div>
+              <div class="meta-line">Поиск: ${escapeHtml(elapsed(diagnostic.searchMs))} · Обработка: ${escapeHtml(elapsed(diagnostic.processingMs))} · Получение аудио: ${escapeHtml(elapsed(diagnostic.captureMs))} · Распознавание: ${escapeHtml(elapsed(diagnostic.asrMs))}</div>`}
+            ${coverage ? `<div class="meta-line">Покрытие архива: ${escapeHtml(duration(coverage.coveredSeconds))} из ${escapeHtml(duration(coverage.requestedSeconds))} · Не покрыто: ${escapeHtml(duration(coverage.missingSeconds))}</div>` : ''}
+            ${gaps.map(gap => `<div class="meta-line action-error-line">Пропуск в архиве: ${escapeHtml(range(gap))} (${escapeHtml(duration(gap?.durationSeconds))})</div>`).join('')}
+            ${issues.map(issue => `<div class="meta-line action-error-line">${escapeHtml(typeof issue === 'string' ? issue : issue?.error || issue?.code || 'Ошибка без подробностей')}</div>`).join('')}
+          </div>`;
+      }).join('')}
+    </details>`;
 }
 
 function isActionBusy(actionId) {
@@ -476,11 +580,15 @@ function applySchedulerState(value) {
 }
 
 function formatScheduledTime(value) {
-  const hasZone = /(?:Z|[+-]\d\d:\d\d)$/.test(String(value || ''));
-  const date = new Date(hasZone ? value : `${value}+05:00`);
-  return Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('ru-RU', {
-    timeZone: schedulerState?.timeZone || 'Asia/Yekaterinburg', dateStyle: 'short', timeStyle: 'medium'
-  }).format(date) : String(value || '');
+  try {
+    const zone = normalizeBrowserTimeZone(schedulerState?.timeZone || displayTimeZone(), DEFAULT_DISPLAY_TIME_ZONE);
+    const epoch = hasExplicitTimeZone(value) ? Date.parse(value) : zonedDateTimeMs(value, zone);
+    return new Intl.DateTimeFormat('ru-RU', {
+      timeZone: zone, dateStyle: 'short', timeStyle: 'medium'
+    }).format(new Date(epoch));
+  } catch {
+    return String(value || '');
+  }
 }
 
 function updateActionCountdowns() {
@@ -501,7 +609,7 @@ function updateActionCountdowns() {
       const clock = [Math.floor(seconds / 3600) % 24, Math.floor(seconds / 60) % 60, seconds % 60]
         .map(number => String(number).padStart(2, '0')).join(':');
       element.textContent = seconds ? `До запуска в фоне: ${days ? `${days} д. ` : ''}${clock}` : 'Ожидает запуска в фоновой очереди';
-      element.title = `Следующий запуск: ${formatScheduledTime(schedule.nextRunAt)} (${schedulerState.timeZone || 'Asia/Yekaterinburg'})`;
+      element.title = `Следующий запуск: ${formatScheduledTime(schedule.nextRunAt)} (${schedulerState.timeZone || displayTimeZone()})`;
     }
   }
 }
@@ -513,29 +621,31 @@ function renderActionGroupPicker(selectedGroupIds = []) {
   }
 
   const selected = new Set(selectedGroupIds);
-  elements.actionGroupList.innerHTML = openAiGroups.map(group => `
+  elements.actionGroupList.innerHTML = openAiGroups.map(group => {
+    const displayRange = groupRangeInDisplayTimeZone(group);
+    return `
     <label class="action-group-option">
       <input data-group-id="${escapeHtml(group.id)}" type="checkbox" ${selected.has(group.id) ? 'checked' : ''}>
       <span>${escapeHtml(group.name)}</span>
-      <small>${group.channels.length} ${pluralRu(group.channels.length, 'камера', 'камеры', 'камер')} · ${escapeHtml(timeOnly(group.from))}-${escapeHtml(timeOnly(group.to))}</small>
+      <small>${group.channels.length} ${pluralRu(group.channels.length, 'камера', 'камеры', 'камер')} · ${escapeHtml(timeOnly(displayRange.from))}-${escapeHtml(timeOnly(displayRange.to))}</small>
     </label>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function switchTab(tabName) {
-  const openAiActive = tabName === 'openai';
-
-  elements.audioTab.hidden = openAiActive;
-  elements.openAiTab.hidden = !openAiActive;
-  elements.audioTab.classList.toggle('active', !openAiActive);
-  elements.openAiTab.classList.toggle('active', openAiActive);
-
-  elements.audioTabButton.classList.toggle('active', !openAiActive);
-  elements.openAiTabButton.classList.toggle('active', openAiActive);
-  elements.audioTabButton.classList.toggle('secondary', openAiActive);
-  elements.openAiTabButton.classList.toggle('secondary', !openAiActive);
-  elements.audioTabButton.setAttribute('aria-selected', String(!openAiActive));
-  elements.openAiTabButton.setAttribute('aria-selected', String(openAiActive));
+  for (const panel of document.querySelectorAll('[data-tab-panel]')) {
+    const active = panel.dataset.tabPanel === tabName;
+    panel.hidden = !active;
+    panel.classList.toggle('active', active);
+  }
+  for (const button of document.querySelectorAll('.tab-button[data-tab]')) {
+    const active = button.dataset.tab === tabName;
+    button.classList.toggle('active', active);
+    button.classList.toggle('secondary', !active);
+    button.setAttribute('aria-selected', String(active));
+  }
+  if (tabName === 'audio-files') audioFilesTab.refreshSettings();
 }
 
 async function startLiveAudio(reason = 'started') {
@@ -751,6 +861,7 @@ function saveGroupFromForm() {
     channels,
     from,
     to,
+    timeZone: displayTimeZone(),
     updatedAt: new Date().toISOString()
   };
 
@@ -803,8 +914,9 @@ function handleGroupListClick(event) {
 function loadGroupIntoForm(group) {
   editingGroupId = group.id;
   elements.openAiGroupName.value = group.name;
-  elements.openAiGroupFrom.value = group.from;
-  elements.openAiGroupTo.value = group.to;
+  const displayRange = groupRangeInDisplayTimeZone(group);
+  elements.openAiGroupFrom.value = displayRange.from.slice(0, 16);
+  elements.openAiGroupTo.value = displayRange.to.slice(0, 16);
   renderGroupChannelPicker(group.channels);
   elements.openAiSaveGroupButton.textContent = 'Обновить группу';
   setGroupStatus('Редактирование', 'busy');
@@ -831,6 +943,7 @@ function openActionDialog(action = null) {
   elements.actionDialogTitle.textContent = action ? 'Изменить действие' : 'Создать действие';
   elements.actionName.value = action?.name || '';
   elements.actionQuestion.value = action?.question || '';
+  elements.actionDestination.value = action?.destination || 'email';
   elements.actionPeriodMode.value = action?.periodMode || 'daily';
   elements.actionDayPreset.value = action?.dayPreset || 'today';
   elements.actionCustomDate.value = action?.customDate || toDateInputLocal(new Date());
@@ -851,22 +964,24 @@ function closeActionDialog() {
 function saveActionFromDialog() {
   const groupIds = selectedActionDialogGroupIds();
   const question = elements.actionQuestion.value.trim();
+  const destination = elements.actionDestination.value === 'drive' ? 'drive' : 'email';
   const periodMode = normalizePeriodMode(elements.actionPeriodMode.value);
   const dayPreset = elements.actionDayPreset.value || 'today';
   const customDate = elements.actionCustomDate.value || toDateInputLocal(new Date());
   const name = elements.actionName.value.trim() || firstMeaningfulLine(question) || `Действие ${openAiActions.length + 1}`;
-  const canSendReports = periodMode === 'daily' || periodMode === 'weekly';
+  const canSchedule = periodMode === 'daily' || periodMode === 'weekly';
+  const canSendReports = destination === 'email' && canSchedule;
 
   if (!groupIds.length) {
     setOpenAiStatus('Выберите группы для действия');
     return;
   }
-  if (!question) {
+  if (destination === 'email' && !question) {
     setOpenAiStatus('Введите вопрос для действия');
     elements.actionQuestion.focus();
     return;
   }
-  if (canSendReports && dayPreset === 'custom' && !customDate) {
+  if (canSchedule && dayPreset === 'custom' && !customDate) {
     setOpenAiStatus('Укажите дату запуска');
     elements.actionCustomDate.focus();
     return;
@@ -882,12 +997,13 @@ function saveActionFromDialog() {
     name,
     groupIds,
     question,
+    destination,
     periodMode,
     dayPreset,
     customDate,
     reportDaily: canSendReports && elements.actionReportDaily.checked,
     reportWeekly: canSendReports && elements.actionReportWeekly.checked,
-    runOnWeekends: canSendReports && elements.actionRunOnWeekends.checked,
+    runOnWeekends: canSchedule && elements.actionRunOnWeekends.checked,
     createdAt: previous?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     lastRun: previous?.lastRun || null
@@ -920,7 +1036,7 @@ function handleActionListClick(event) {
   if (isActionBusy(action.id)) return;
 
   if (button.dataset.actionCommand === 'run') {
-    if (action.periodMode !== 'once') {
+    if (action.destination === 'drive' || action.periodMode !== 'once') {
       void triggerScheduledOpenAiAction(action).catch(error => {
         const message = `Ошибка запуска: ${error.message || error}`;
         actionRunNotices.set(action.id, { message, error: true });
@@ -996,12 +1112,19 @@ function deleteAction(actionId) {
 
 function updateActionPeriodModeUi() {
   const scheduled = elements.actionPeriodMode.value !== 'once';
+  const email = elements.actionDestination.value !== 'drive';
   elements.actionDayPresetLabel.hidden = !scheduled;
   elements.actionCustomDateLabel.hidden = !scheduled || elements.actionDayPreset.value !== 'custom';
   elements.actionScheduleOptions.hidden = !scheduled;
-  elements.actionReportOptions.hidden = !scheduled;
+  elements.actionReportOptions.hidden = !scheduled || !email;
+  elements.actionQuestionField.hidden = !email;
+  elements.actionDestinationHint.textContent = email
+    ? 'OpenAI подготовит отчёт и отправит его на указанные почты.'
+    : 'Для каждой полностью обработанной камеры TXT сначала сохраняется на компьютере, затем отправляется на Google Диск отдельной очередью. При ошибке неполный TXT не выгружается. OpenAI и почта не используются.';
   if (!scheduled) {
     elements.actionRunOnWeekends.checked = false;
+  }
+  if (!scheduled || !email) {
     elements.actionReportDaily.checked = false;
     elements.actionReportWeekly.checked = false;
   }
@@ -1050,7 +1173,9 @@ function resolveActionSelections(action) {
 
 function resolveGroupRangesForAction(group, action) {
   if (action.periodMode === 'once') {
-    return secondsBetween(group.from, group.to) > 0 ? [{ from: group.from, to: group.to }] : [];
+    const from = localValueToIso(group.from, group.timeZone || DEFAULT_CAMERA_TIME_ZONE);
+    const to = localValueToIso(group.to, group.timeZone || DEFAULT_CAMERA_TIME_ZONE);
+    return secondsBetween(from, to) > 0 ? [{ from, to }] : [];
   }
 
   const dates = action.periodMode === 'weekly'
@@ -1058,13 +1183,16 @@ function resolveGroupRangesForAction(group, action) {
     : [resolveDailyActionDate(action)];
 
   return dates.filter(date => action.periodMode !== 'daily' || action.runOnWeekends || !isWeekendDatePart(date)).map(date => {
-    const from = combineDateAndTime(date, timeOnly(group.from));
-    let to = combineDateAndTime(date, timeOnly(group.to));
+    const displayRange = groupRangeInDisplayTimeZone(group);
+    const fromLocal = combineDateAndTime(date, timeOnly(displayRange.from));
+    let toLocal = combineDateAndTime(date, timeOnly(displayRange.to));
 
-    if (secondsBetween(from, to) <= 0) {
-      to = combineDateAndTime(offsetDatePart(date, 1), timeOnly(group.to));
+    if (displayRange.to.slice(0, 10) !== displayRange.from.slice(0, 10)
+      || localWallClockSeconds(toLocal) <= localWallClockSeconds(fromLocal)) {
+      toLocal = combineDateAndTime(offsetDatePart(date, 1), timeOnly(displayRange.to));
     }
-
+    const from = localValueToIso(fromLocal, displayTimeZone());
+    const to = localValueToIso(toLocal, displayTimeZone());
     return secondsBetween(from, to) > 0 ? { from, to } : null;
   }).filter(Boolean);
 }
@@ -1076,7 +1204,7 @@ function resolveDailyActionDate(action) {
     today: 0,
     tomorrow: 1
   }[action.dayPreset] ?? 0;
-  let date = offsetDatePart(toDateInputLocal(new Date()), offset);
+  let date = offsetDatePart(zonedDatePart(new Date(), displayTimeZone()), offset);
   if (action.dayPreset === 'yesterday' && !action.runOnWeekends) {
     while (isWeekendDatePart(date)) date = offsetDatePart(date, -1);
   }
@@ -1115,6 +1243,7 @@ function persistActionRun(action, lastRun) {
         periodMode: action.periodMode,
         dayPreset: action.dayPreset,
         customDate: action.customDate,
+        destination: action.destination,
         reportDaily: action.reportDaily,
         reportWeekly: action.reportWeekly,
         runOnWeekends: action.runOnWeekends
@@ -1124,10 +1253,14 @@ function persistActionRun(action, lastRun) {
 }
 
 async function runOpenAiWorkflow(action) {
+  // Drive work always uses the server pipeline: completeness checks, durable
+  // local results and delivery retries must not depend on an open browser tab.
+  if (action?.destination === 'drive') return triggerScheduledOpenAiAction(action);
   stopOpenAiWorkflow({ quiet: true });
 
   const selections = resolveActionSelections(action);
   const question = String(action?.question || '').trim();
+  const destination = action?.destination === 'drive' ? 'drive' : 'email';
 
   if (!action) {
     setOpenAiStatus('Выберите действие');
@@ -1149,7 +1282,7 @@ async function runOpenAiWorkflow(action) {
     });
     return;
   }
-  if (!question) {
+  if (destination === 'email' && !question) {
     setOpenAiStatus('В действии нет вопроса');
     return;
   }
@@ -1162,9 +1295,11 @@ async function runOpenAiWorkflow(action) {
   activeOpenAiActionStartedAt = startedAt;
   const signal = openAiController.signal;
   const contextLines = [];
+  const transcriptEntries = [];
   const progress = createOpenAiProgressState(action, selections);
   let answerData = null;
   let reportData = null;
+  let driveData = null;
   let manualClaim = null;
 
   renderOpenAiActions();
@@ -1200,6 +1335,8 @@ async function runOpenAiWorkflow(action) {
       const query = new URLSearchParams(cameraParamsForChannel(selection.channel));
       query.set('from', selection.from);
       query.set('to', selection.to);
+      query.set('timeZone', displayTimeZone());
+      query.set('cameraTimeZone', cameraTimeZone());
       query.set('_', Date.now());
 
       const searchPath = `/api/recordings/search?${query}`;
@@ -1225,8 +1362,10 @@ async function runOpenAiWorkflow(action) {
         appendOpenAiNotice(`${selectionLabel}: ${searchData.warning}`);
       }
 
+      const cameraFrom = searchData.cameraFrom || localValueInZone(selection.from, cameraTimeZone());
+      const cameraTo = searchData.cameraTo || localValueInZone(selection.to, cameraTimeZone());
       const items = (searchData.items || [])
-        .map(item => ({ item, coverage: recordingCoverage(item, selection.from, selection.to) }))
+        .map(item => ({ item, coverage: recordingCoverage(item, cameraFrom, cameraTo) }))
         .filter(entry => entry.coverage && entry.coverage.durationSeconds > 0);
 
       progress.knownRecordings += items.length;
@@ -1249,6 +1388,7 @@ async function runOpenAiWorkflow(action) {
           item: entry.item,
           coverage: entry.coverage,
           contextLines,
+          transcriptEntries,
           progress,
           runId,
           signal
@@ -1262,12 +1402,49 @@ async function runOpenAiWorkflow(action) {
 
     ensureOpenAiRun(runId, signal);
     elements.openAiTranscriptStatus.textContent = contextLines.length ? 'Транскрибация готова' : 'Текст не найден';
-    setOpenAiStage(progress, 'ask', 'Отправляю вопрос в OpenAI');
-    updateOpenAiProgressView(progress, 92);
-    elements.openAiAnswerStatus.textContent = 'Запрос';
+    if (destination === 'drive') {
+      setOpenAiStage(progress, 'drive', 'Загружаю TXT-файлы на Google Диск');
+      updateOpenAiProgressView(progress, 96);
+      elements.openAiAnswerStatus.textContent = 'Google Диск';
+      try {
+        driveData = await api('/api/drive/transcripts', {
+          method: 'POST',
+          body: {
+            action: { id: action.id, name: action.name, periodMode: action.periodMode, destination },
+            runKey: manualClaim?.runKey || `manual:${startedAt}`,
+            from: progress.from,
+            to: progress.to,
+            timeZone: displayTimeZone(),
+            selections: selections.map(selection => ({
+              channel: selection.channel,
+              label: channelLabel(selection.channel),
+              groupName: selection.groupName,
+              from: selection.from,
+              to: selection.to
+            })),
+            entries: transcriptEntries
+          },
+          signal
+        });
+      } catch (error) {
+        throw enrichOpenAiError(error, progress, {
+          stage: 'drive',
+          endpoint: '/api/drive/transcripts',
+          transcriptLines: contextLines.length
+        });
+      }
+      answerData = { answer: `На Google Диск загружено файлов: ${driveUploadsSummary(driveData.uploads)}`, model: '', responseId: '' };
+      elements.openAiAnswer.textContent = answerData.answer;
+      elements.openAiAnswer.classList.remove('is-empty');
+      elements.openAiAnswerStatus.textContent = 'Загружено';
+      appendOpenAiRunLog(answerData.answer);
+    } else {
+      setOpenAiStage(progress, 'ask', 'Отправляю вопрос в OpenAI');
+      updateOpenAiProgressView(progress, 92);
+      elements.openAiAnswerStatus.textContent = 'Запрос';
 
-    try {
-      answerData = await api('/api/openai/ask', {
+      try {
+        answerData = await api('/api/openai/ask', {
         method: 'POST',
         body: {
           question,
@@ -1284,7 +1461,8 @@ async function runOpenAiWorkflow(action) {
             name: group.name,
             channels: group.channels,
             from: group.from,
-            to: group.to
+            to: group.to,
+            timeZone: group.timeZone
           })),
           channels: selections.map(selection => ({
             channel: selection.channel,
@@ -1295,22 +1473,22 @@ async function runOpenAiWorkflow(action) {
           }))
         },
         signal
-      });
-    } catch (error) {
-      throw enrichOpenAiError(error, progress, {
-        stage: 'ask',
-        endpoint: '/api/openai/ask',
-        transcriptLines: contextLines.length
-      });
-    }
+        });
+      } catch (error) {
+        throw enrichOpenAiError(error, progress, {
+          stage: 'ask',
+          endpoint: '/api/openai/ask',
+          transcriptLines: contextLines.length
+        });
+      }
 
     ensureOpenAiRun(runId, signal);
     elements.openAiAnswer.textContent = answerData.answer || 'Нет ответа';
     elements.openAiAnswer.classList.toggle('is-empty', !answerData.answer);
     elements.openAiAnswerStatus.textContent = answerData.model || 'Готово';
 
-    const reportTypes = actionReportTypes(action);
-    if (reportTypes.length) {
+      const reportTypes = actionReportTypes(action);
+      if (reportTypes.length) {
       setOpenAiStage(progress, 'report', 'Отправляю отчёт на почту');
       updateOpenAiProgressView(progress, 96);
       try {
@@ -1333,6 +1511,7 @@ async function runOpenAiWorkflow(action) {
           transcriptLines: contextLines.length
         });
       }
+      }
     }
 
     setOpenAiStage(progress, 'done', 'Готово');
@@ -1352,7 +1531,8 @@ async function runOpenAiWorkflow(action) {
       answer: answerData.answer || '',
       transcriptLines: contextLines.length,
       selections: selections.length,
-      reports: reportData?.sent || []
+      reports: reportData?.sent || [],
+      uploads: driveData?.uploads || []
     });
     log({
       ok: true,
@@ -1452,6 +1632,7 @@ async function sendActionReports(options) {
       deliveryKey: options.deliveryKey || '',
       recipients,
       generatedAt: new Date().toISOString(),
+      timeZone: displayTimeZone(),
       from: options.progress.from,
       to: options.progress.to,
       question: options.question,
@@ -1472,7 +1653,8 @@ async function sendActionReports(options) {
         name: group.name,
         channels: group.channels,
         from: group.from,
-        to: group.to
+        to: group.to,
+        timeZone: group.timeZone
       })),
       channels: options.selections.map(selection => ({
         channel: selection.channel,
@@ -1537,6 +1719,22 @@ async function transcribeOpenAiRecording(options) {
     if (hadText) {
       chunksWithText += 1;
       options.progress.transcriptChunks += appendOpenAiContext(options.contextLines, options.groupName, options.channel, options.item, data.segments, data.text);
+      appendDriveTranscriptEntries(
+        options.transcriptEntries,
+        options.groupName,
+        options.channel,
+        options.item,
+        data.segments,
+        data.text,
+        {
+          offsetSeconds: data.offsetSeconds !== undefined && data.offsetSeconds !== null && Number.isFinite(Number(data.offsetSeconds))
+            ? Number(data.offsetSeconds)
+            : offsetSeconds,
+          durationSeconds: Number.isFinite(Number(data.durationSeconds)) && Number(data.durationSeconds) > 0
+            ? Number(data.durationSeconds)
+            : durationSeconds
+        }
+      );
     }
 
     const consumedSeconds = Math.max(0.5, Math.min(data.durationSeconds || durationSeconds, remainingSeconds));
@@ -1559,7 +1757,7 @@ async function transcribeOpenAiRecording(options) {
   }
 
   if (chunksWithText === 0) {
-    appendOpenAiNotice(`${options.groupName} · ${channelLabel(options.channel)}: речь не найдена в записи ${formatTime(options.item.startTime)} - ${formatTime(options.item.endTime)}`);
+    appendOpenAiNotice(`${options.groupName} · ${channelLabel(options.channel)}: речь не найдена в записи ${formatCameraTime(options.item.startTime)} - ${formatCameraTime(options.item.endTime)}`);
   }
 
   options.progress.completedRecordings += 1;
@@ -1620,6 +1818,7 @@ function createOpenAiProgressState(action, selections) {
     errorStage: '',
     percent: 0,
     actionName: action?.name || '',
+    destination: action?.destination === 'drive' ? 'drive' : 'email',
     from,
     to,
     totalChannels: selections.length,
@@ -1653,19 +1852,11 @@ function sortedLocalDateTimes(values) {
 }
 
 function localDateTimeMs(value) {
-  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
-  if (!match) {
-    const fallback = new Date(value).getTime();
-    return Number.isFinite(fallback) ? fallback : 0;
+  try {
+    return zonedDateTimeMs(value, displayTimeZone());
+  } catch {
+    return 0;
   }
-  return new Date(
-    Number(match[1]),
-    Number(match[2]) - 1,
-    Number(match[3]),
-    Number(match[4]),
-    Number(match[5]),
-    Number(match[6] || 0)
-  ).getTime();
 }
 
 function startOpenAiRunProgress(state) {
@@ -1675,10 +1866,20 @@ function startOpenAiRunProgress(state) {
   appendOpenAiRunLog(`Старт действия: ${state.actionName || 'без названия'}`);
   appendOpenAiRunLog(`Период: ${formatTime(state.from)} - ${formatTime(state.to)}, задач: ${state.totalChannels}`);
   setOpenAiStage(state, 'search', 'Поиск записей');
+  const askStep = document.querySelector('[data-openai-stage="ask"]');
+  const reportStep = document.querySelector('[data-openai-stage="report"]');
+  elements.openAiAnswerTitle.textContent = state.destination === 'drive' ? 'Результат Google Диска' : 'Ответ ChatGPT';
+  if (askStep) askStep.textContent = state.destination === 'drive' ? 'OpenAI не требуется' : 'Запрос OpenAI';
+  if (reportStep) reportStep.textContent = state.destination === 'drive' ? 'Загрузка на Диск' : 'Отправка отчёта';
   updateOpenAiProgressView(state, 0);
 }
 
 function resetOpenAiProgressView() {
+  const askStep = document.querySelector('[data-openai-stage="ask"]');
+  const reportStep = document.querySelector('[data-openai-stage="report"]');
+  elements.openAiAnswerTitle.textContent = 'Ответ ChatGPT';
+  if (askStep) askStep.textContent = 'Запрос OpenAI';
+  if (reportStep) reportStep.textContent = 'Отправка отчёта';
   setOpenAiProgress(0);
   elements.openAiProgressStage.textContent = OPENAI_STAGE_LABELS.idle;
   elements.openAiStageProgress.textContent = `0/${OPENAI_STAGE_ORDER.length}`;
@@ -1714,21 +1915,27 @@ function updateOpenAiProgressView(state, percent = state.percent) {
 }
 
 function updateOpenAiStageTrack(state) {
-  const activeIndex = OPENAI_STAGE_ORDER.indexOf(state.errorStage || state.stage);
+  const activeStage = openAiStageTrackKey(state.errorStage || state.stage);
+  const activeIndex = OPENAI_STAGE_ORDER.indexOf(activeStage);
   const doneCount = completedOpenAiStageCount(state);
 
   for (const item of document.querySelectorAll('[data-openai-stage]')) {
     const index = OPENAI_STAGE_ORDER.indexOf(item.dataset.openaiStage);
     item.classList.toggle('done', index >= 0 && index < doneCount);
-    item.classList.toggle('active', item.dataset.openaiStage === state.stage && state.stage !== 'error');
+    item.classList.toggle('active', item.dataset.openaiStage === openAiStageTrackKey(state.stage) && state.stage !== 'error');
     item.classList.toggle('error', state.stage === 'error' && index === activeIndex);
   }
 }
 
 function completedOpenAiStageCount(state) {
   if (state.stage === 'done') return OPENAI_STAGE_ORDER.length;
-  const index = OPENAI_STAGE_ORDER.indexOf(state.stage === 'error' ? state.errorStage : state.stage);
+  const stage = openAiStageTrackKey(state.stage === 'error' ? state.errorStage : state.stage);
+  const index = OPENAI_STAGE_ORDER.indexOf(stage);
   return index > 0 ? index : 0;
+}
+
+function openAiStageTrackKey(stage) {
+  return stage === 'drive' ? 'report' : stage;
 }
 
 function transcriptionProgressPercent(state) {
@@ -1737,7 +1944,12 @@ function transcriptionProgressPercent(state) {
 
 function appendOpenAiRunLog(message) {
   const current = elements.openAiRunLog.textContent === 'Журнал пуст' ? '' : elements.openAiRunLog.textContent;
-  const time = new Date().toLocaleTimeString();
+  const time = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: displayTimeZone(),
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  }).format(new Date());
   const lines = `${current}${current ? '\n' : ''}[${time}] ${message}`.split('\n').slice(-80);
   elements.openAiRunLog.textContent = lines.join('\n');
   elements.openAiRunLog.scrollTop = elements.openAiRunLog.scrollHeight;
@@ -1817,6 +2029,7 @@ async function loadPersistedState() {
     const data = await api('/api/storage');
     storageAvailable = true;
     applySchedulerState(data.scheduler);
+    const previousDisplayTimeZone = displayTimeZone();
 
     if (data.settings && typeof data.settings === 'object') {
       uiSettings = { ...uiSettings, ...data.settings };
@@ -1840,6 +2053,7 @@ async function loadPersistedState() {
     }
 
     applySettingsToControls();
+    convertDateTimeInputsBetweenZones(previousDisplayTimeZone, displayTimeZone());
     renderChannelButtons();
     renderChannelNameFields();
     renderGroupChannelPicker();
@@ -1949,6 +2163,7 @@ async function loadHealth() {
       data.transcriber?.available ? `GigaAM ${data.transcriber.version || 'ok'}` : 'GigaAM нужен',
       data.config.openAi?.hasApiKey ? `OpenAI ${data.config.openAi.model}` : 'OpenAI ключ не задан',
       data.config.reports?.smtpConfigured ? `SMTP ${reportEmailList().length ? 'ok' : 'нет получателей'}` : 'SMTP не задан',
+      data.config.drive?.configured ? `Google Диск ${data.config.drive.authType || 'ok'}` : 'Google Диск не настроен',
       data.config.database?.enabled ? `PostgreSQL ${storageAvailable ? 'ok' : 'недоступен'}` : 'PostgreSQL выключен',
       data.config.scheduler?.enabled ? `планировщик ${data.config.scheduler.intervalSeconds || 30}с` : 'планировщик выключен',
       `фильтр: ${elements.audioFilter.value}`,
@@ -2060,6 +2275,7 @@ function renderTranscriptionModels(runtime = {}) {
   elements.transcriptionModelStatus.textContent = status;
   elements.transcriptionModelStatus.hidden = !status;
   elements.transcriptionModelStatus.classList.toggle('error', transcriptionModelMessageIsError);
+  audioFilesTab.refreshSettings();
 }
 
 async function saveTranscriptionModel(model) {
@@ -2121,7 +2337,7 @@ async function searchRecordings() {
     return;
   }
 
-  if (new Date(to).getTime() <= new Date(from).getTime()) {
+  if (zonedDateTimeMs(to, displayTimeZone()) <= zonedDateTimeMs(from, displayTimeZone())) {
     const message = 'Конец периода должен быть позже начала.';
     setArchiveSearchStatus(message, 'warn');
     renderRecordingsMessage(message, 'warn');
@@ -2139,7 +2355,9 @@ async function searchRecordings() {
     const query = new URLSearchParams({
       ...currentCameraParams(),
       from,
-      to
+      to,
+      timeZone: displayTimeZone(),
+      cameraTimeZone: cameraTimeZone()
     });
     const data = await api(`/api/recordings/search?${query}`);
 
@@ -2248,8 +2466,8 @@ function renderRecordings(vendor, items, emptyMessage = 'Нет результа
       const canDownload = Boolean(item.fileName);
       return `
         <tr class="${selected}">
-          <td>${escapeHtml(formatTime(item.startTime))}</td>
-          <td>${escapeHtml(formatTime(item.endTime))}</td>
+          <td>${escapeHtml(formatCameraTime(item.startTime))}</td>
+          <td>${escapeHtml(formatCameraTime(item.endTime))}</td>
           <td class="source" title="${escapeHtml(source)}">${escapeHtml(source)}</td>
           <td>
             <div class="recording-actions">
@@ -2286,7 +2504,7 @@ function recordingQuery(item) {
 
 function recordingLabel(item) {
   const source = item.filePath || item.fileName || item.playbackUri || '';
-  return `${formatTime(item.startTime)} - ${formatTime(item.endTime)}${source ? ` · ${source}` : ''}`;
+  return `${formatCameraTime(item.startTime)} - ${formatCameraTime(item.endTime)}${source ? ` · ${source}` : ''}`;
 }
 
 function recordingQueryForChannel(item, channel, fallback = {}) {
@@ -2348,7 +2566,7 @@ function appendOpenAiTranscript(groupName, channel, item, segments = [], fallbac
 
   const source = document.createElement('div');
   source.className = 'transcript-source';
-  source.textContent = `${groupName ? `${groupName} · ` : ''}${channelLabel(channel)} · ${formatTime(item.startTime)} - ${formatTime(item.endTime)}`;
+  source.textContent = `${groupName ? `${groupName} · ` : ''}${channelLabel(channel)} · ${formatCameraTime(item.startTime)} - ${formatCameraTime(item.endTime)}`;
   elements.openAiTranscript.append(source);
 
   for (const segment of usefulSegments) {
@@ -2414,7 +2632,7 @@ function setSelectedRecording(item) {
   }
 
   const source = item.filePath || item.fileName || item.playbackUri || '';
-  const text = `${channelLabel(selectedChannel)} · ${formatTime(item.startTime)} - ${formatTime(item.endTime)}${source ? ` · ${source}` : ''}`;
+  const text = `${channelLabel(selectedChannel)} · ${formatCameraTime(item.startTime)} - ${formatCameraTime(item.endTime)}${source ? ` · ${source}` : ''}`;
   elements.selectedRecording.textContent = text;
   elements.selectedRecording.title = text;
   elements.selectedRecording.classList.remove('is-empty');
@@ -2498,6 +2716,35 @@ function applySettingsToControls() {
   elements.audioFilter.value = uiSettings.audioFilter || 'voice';
   elements.transcriptSeconds.value = String(uiSettings.transcriptSeconds || DEFAULT_TRANSCRIPT_SECONDS);
   elements.reportEmails.value = uiSettings.reportEmails || '';
+  elements.cameraTimeZone.value = normalizeBrowserTimeZone(uiSettings.cameraTimeZone, DEFAULT_CAMERA_TIME_ZONE);
+  elements.displayTimeZone.value = normalizeBrowserTimeZone(uiSettings.displayTimeZone, DEFAULT_DISPLAY_TIME_ZONE);
+  audioFilesTab.refreshSettings();
+}
+
+function appendDriveTranscriptEntries(entries, groupName, channel, item, segments = [], fallbackText = '', chunk = {}) {
+  if (!Array.isArray(entries)) return 0;
+  const usefulSegments = normalizedTranscriptSegments(segments, fallbackText);
+  for (const segment of usefulSegments) {
+    const hasSegmentStart = segment.start !== undefined && segment.start !== null && segment.start !== ''
+      && Number.isFinite(Number(segment.start));
+    const hasSegmentEnd = segment.end !== undefined && segment.end !== null && segment.end !== ''
+      && Number.isFinite(Number(segment.end));
+    const startOffsetSeconds = hasSegmentStart ? Number(segment.start) : Number(chunk.offsetSeconds || 0);
+    const endOffsetSeconds = hasSegmentEnd
+      ? Number(segment.end)
+      : startOffsetSeconds + Math.max(0, Number(chunk.durationSeconds || 0));
+    const startMs = absoluteCameraSegmentMs(item.startTime, startOffsetSeconds);
+    const endMs = absoluteCameraSegmentMs(item.startTime, endOffsetSeconds);
+    entries.push({
+      channel,
+      label: channelLabel(channel),
+      groupName: groupName || 'Группа',
+      start: Number.isFinite(startMs) ? new Date(startMs).toISOString() : localValueToIso(item.startTime, cameraTimeZone()),
+      end: Number.isFinite(endMs) ? new Date(endMs).toISOString() : localValueToIso(item.endTime, cameraTimeZone()),
+      text: String(segment.text || '').trim()
+    });
+  }
+  return usefulSegments.length;
 }
 
 function saveUiSettings() {
@@ -2506,9 +2753,12 @@ function saveUiSettings() {
     stream: elements.stream.value || 'main',
     audioFilter: elements.audioFilter.value || 'voice',
     transcriptSeconds: getTranscriptSeconds(),
-    reportEmails: elements.reportEmails.value.trim()
+    reportEmails: elements.reportEmails.value.trim(),
+    cameraTimeZone: normalizeBrowserTimeZone(elements.cameraTimeZone.value, DEFAULT_CAMERA_TIME_ZONE),
+    displayTimeZone: normalizeBrowserTimeZone(elements.displayTimeZone.value, DEFAULT_DISPLAY_TIME_ZONE)
   };
   localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(uiSettings));
+  audioFilesTab.refreshSettings();
   syncStorage('/api/storage/settings', { settings: uiSettings, selectedChannel });
 }
 
@@ -2519,6 +2769,8 @@ function loadUiSettings() {
     audioFilter: 'voice',
     transcriptSeconds: DEFAULT_TRANSCRIPT_SECONDS,
     reportEmails: '',
+    cameraTimeZone: DEFAULT_CAMERA_TIME_ZONE,
+    displayTimeZone: DEFAULT_DISPLAY_TIME_ZONE,
     ...safeJson(localStorage.getItem(STORAGE_KEYS.settings))
   };
 }
@@ -2564,6 +2816,7 @@ function normalizeOpenAiGroup(group, index = 0) {
     channels,
     from,
     to,
+    timeZone: normalizeBrowserTimeZone(group.timeZone, DEFAULT_CAMERA_TIME_ZONE),
     createdAt: group.createdAt || '',
     updatedAt: group.updatedAt || ''
   };
@@ -2573,18 +2826,20 @@ function normalizeOpenAiAction(action, index = 0) {
   if (!action || typeof action !== 'object') return null;
   const groupIds = Array.isArray(action.groupIds) ? action.groupIds.map(String).filter(Boolean) : [];
   const question = String(action.question || '').trim();
-  if (!groupIds.length || !question) return null;
+  const destination = action.destination === 'drive' ? 'drive' : 'email';
+  if (!groupIds.length || (destination === 'email' && !question)) return null;
   const periodMode = normalizePeriodMode(action.periodMode);
   return {
     id: String(action.id || createId(`action-${index + 1}`)),
     name: String(action.name || `Действие ${index + 1}`),
     groupIds: [...new Set(groupIds)],
     question,
+    destination,
     periodMode,
     dayPreset: ['today', 'yesterday', 'tomorrow', 'custom'].includes(action.dayPreset) ? action.dayPreset : 'today',
     customDate: String(action.customDate || ''),
-    reportDaily: Boolean(action.reportDaily) && periodMode !== 'once',
-    reportWeekly: Boolean(action.reportWeekly) && periodMode !== 'once',
+    reportDaily: destination === 'email' && Boolean(action.reportDaily) && periodMode !== 'once',
+    reportWeekly: destination === 'email' && Boolean(action.reportWeekly) && periodMode !== 'once',
     runOnWeekends: periodMode !== 'once' && (action.runOnWeekends === undefined ? true : Boolean(action.runOnWeekends)),
     createdAt: action.createdAt || '',
     updatedAt: action.updatedAt || '',
@@ -2645,6 +2900,139 @@ function getTranscriptSeconds() {
   return clamp(Number(elements.transcriptSeconds.value || DEFAULT_TRANSCRIPT_SECONDS), 5, 60);
 }
 
+function cameraTimeZone() {
+  return normalizeBrowserTimeZone(elements.cameraTimeZone?.value || uiSettings.cameraTimeZone, DEFAULT_CAMERA_TIME_ZONE);
+}
+
+function displayTimeZone() {
+  return normalizeBrowserTimeZone(elements.displayTimeZone?.value || uiSettings.displayTimeZone, DEFAULT_DISPLAY_TIME_ZONE);
+}
+
+function displayTimeZoneLabel() {
+  return elements.displayTimeZone?.selectedOptions?.[0]?.textContent || displayTimeZone();
+}
+
+function normalizeBrowserTimeZone(value, fallback = 'UTC') {
+  for (const candidate of [value, fallback, 'UTC']) {
+    try {
+      if (candidate) return new Intl.DateTimeFormat('en', { timeZone: String(candidate) }).resolvedOptions().timeZone;
+    } catch {}
+  }
+  return 'UTC';
+}
+
+function hasExplicitTimeZone(value) {
+  return typeof value === 'string' && /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(value.trim());
+}
+
+function localDateTimeParts(value) {
+  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!match) throw new RangeError(`Некорректное время: ${value}`);
+  return {
+    year: Number(match[1]), month: Number(match[2]), day: Number(match[3]),
+    hour: Number(match[4] || 0), minute: Number(match[5] || 0), second: Number(match[6] || 0)
+  };
+}
+
+function zonedParts(epochMs, timeZone) {
+  const result = {};
+  const formatter = new Intl.DateTimeFormat('en-CA-u-ca-gregory-nu-latn', {
+    timeZone: normalizeBrowserTimeZone(timeZone), calendar: 'gregory', numberingSystem: 'latn',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+  });
+  for (const part of formatter.formatToParts(new Date(epochMs))) {
+    if (part.type !== 'literal') result[part.type] = Number(part.value);
+  }
+  if (result.hour === 24) result.hour = 0;
+  return result;
+}
+
+function partsUtc(parts) {
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour || 0, parts.minute || 0, parts.second || 0);
+}
+
+function zonedDateTimeMs(value, timeZone) {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === 'number') return value;
+  if (hasExplicitTimeZone(value)) {
+    const epoch = Date.parse(value);
+    if (!Number.isFinite(epoch)) throw new RangeError(`Некорректное время: ${value}`);
+    return epoch;
+  }
+  const expected = localDateTimeParts(value);
+  const wall = partsUtc(expected);
+  let epoch = wall;
+  for (let index = 0; index < 4; index += 1) {
+    const actual = zonedParts(epoch, timeZone);
+    const adjustment = wall - partsUtc(actual);
+    epoch += adjustment;
+    if (!adjustment) break;
+  }
+  const actual = zonedParts(epoch, timeZone);
+  if (['year', 'month', 'day', 'hour', 'minute', 'second'].some(key => actual[key] !== expected[key])) {
+    throw new RangeError(`Время ${value} не существует в часовом поясе ${timeZone}`);
+  }
+  return epoch;
+}
+
+function localValueInZone(value, timeZone, withSeconds = true) {
+  const epoch = value instanceof Date || typeof value === 'number' || hasExplicitTimeZone(value)
+    ? (value instanceof Date ? value.getTime() : typeof value === 'number' ? value : Date.parse(value))
+    : zonedDateTimeMs(value, timeZone);
+  const parts = zonedParts(epoch, timeZone);
+  const pad = number => String(number).padStart(2, '0');
+  const result = `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(parts.hour)}:${pad(parts.minute)}`;
+  return withSeconds ? `${result}:${pad(parts.second)}` : result;
+}
+
+function localValueToIso(value, sourceTimeZone) {
+  return new Date(zonedDateTimeMs(value, sourceTimeZone)).toISOString();
+}
+
+function zonedDatePart(value, timeZone) {
+  return localValueInZone(value, timeZone, false).slice(0, 10);
+}
+
+function groupRangeInDisplayTimeZone(group) {
+  const sourceTimeZone = normalizeBrowserTimeZone(group?.timeZone, DEFAULT_CAMERA_TIME_ZONE);
+  try {
+    return {
+      from: localValueInZone(zonedDateTimeMs(group.from, sourceTimeZone), displayTimeZone(), false),
+      to: localValueInZone(zonedDateTimeMs(group.to, sourceTimeZone), displayTimeZone(), false)
+    };
+  } catch {
+    return { from: group?.from || '', to: group?.to || '' };
+  }
+}
+
+function localWallClockSeconds(value) {
+  const parts = localDateTimeParts(value);
+  return (parts.hour * 3600) + (parts.minute * 60) + parts.second;
+}
+
+function handleTimeZoneChanged() {
+  const previousDisplayTimeZone = normalizeBrowserTimeZone(uiSettings.displayTimeZone, DEFAULT_DISPLAY_TIME_ZONE);
+  const nextDisplayTimeZone = displayTimeZone();
+  convertDateTimeInputsBetweenZones(previousDisplayTimeZone, nextDisplayTimeZone);
+  saveUiSettings();
+  renderOpenAiGroups();
+  renderActionGroupPicker(selectedActionDialogGroupIds());
+  renderOpenAiActions();
+  log({ ok: true, cameraTimeZone: cameraTimeZone(), displayTimeZone: nextDisplayTimeZone });
+}
+
+function convertDateTimeInputsBetweenZones(previousTimeZone, nextTimeZone) {
+  const previous = normalizeBrowserTimeZone(previousTimeZone, DEFAULT_DISPLAY_TIME_ZONE);
+  const next = normalizeBrowserTimeZone(nextTimeZone, DEFAULT_DISPLAY_TIME_ZONE);
+  if (previous === next) return;
+  for (const input of [elements.from, elements.to, elements.openAiGroupFrom, elements.openAiGroupTo]) {
+    if (!input?.value) continue;
+    try {
+      input.value = localValueInZone(zonedDateTimeMs(input.value, previous), next, false);
+    } catch {}
+  }
+}
+
 function setDefaultRange() {
   const to = new Date();
   const from = new Date(to.getTime() - 60 * 60 * 1000);
@@ -2653,39 +3041,37 @@ function setDefaultRange() {
 }
 
 function toDatetimeLocal(date) {
-  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
-  return shifted.toISOString().slice(0, 16);
+  return localValueInZone(date, displayTimeZone()).slice(0, 16);
 }
 
 function toDateInputLocal(date) {
-  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
-  return shifted.toISOString().slice(0, 10);
+  return zonedDatePart(date, displayTimeZone());
 }
 
 function offsetDatePart(datePart, days) {
   const [year, month, day] = String(datePart).split('-').map(Number);
   const date = Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)
-    ? new Date(year, month - 1, day)
-    : new Date();
-  date.setDate(date.getDate() + Number(days || 0));
-  return toDateInputLocal(date);
+    ? new Date(Date.UTC(year, month - 1, day))
+    : new Date(Date.UTC(1970, 0, 1));
+  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  return date.toISOString().slice(0, 10);
 }
 
 function startOfWeekDatePart(datePart) {
   const [year, month, day] = String(datePart).split('-').map(Number);
   const date = Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)
-    ? new Date(year, month - 1, day)
-    : new Date();
-  const weekday = date.getDay();
+    ? new Date(Date.UTC(year, month - 1, day))
+    : new Date(Date.UTC(1970, 0, 1));
+  const weekday = date.getUTCDay();
   const offset = weekday === 0 ? -6 : 1 - weekday;
-  date.setDate(date.getDate() + offset);
-  return toDateInputLocal(date);
+  date.setUTCDate(date.getUTCDate() + offset);
+  return date.toISOString().slice(0, 10);
 }
 
 function isWeekendDatePart(datePart) {
   const [year, month, day] = String(datePart || '').split('-').map(Number);
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return false;
-  const weekday = new Date(year, month - 1, day).getDay();
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
   return weekday === 0 || weekday === 6;
 }
 
@@ -2727,8 +3113,9 @@ function actionReportLabels(action) {
 }
 
 function formatDateOnly(value) {
-  const date = new Date(`${value}T00:00`);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
+  const [year, month, day] = String(value || '').split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('ru-RU', { timeZone: 'UTC' });
 }
 
 function firstMeaningfulLine(value) {
@@ -2742,9 +3129,26 @@ function createId(prefix) {
 
 function formatTime(value) {
   if (!value) return '';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
+  try {
+    const epoch = hasExplicitTimeZone(value) ? Date.parse(value) : zonedDateTimeMs(value, displayTimeZone());
+    return new Intl.DateTimeFormat('ru-RU', {
+      timeZone: displayTimeZone(), dateStyle: 'short', timeStyle: 'medium'
+    }).format(new Date(epoch));
+  } catch {
+    return String(value);
+  }
+}
+
+function formatCameraTime(value) {
+  if (!value) return '';
+  try {
+    const epoch = hasExplicitTimeZone(value) ? Date.parse(value) : zonedDateTimeMs(value, cameraTimeZone());
+    return new Intl.DateTimeFormat('ru-RU', {
+      timeZone: displayTimeZone(), dateStyle: 'short', timeStyle: 'medium'
+    }).format(new Date(epoch));
+  } catch {
+    return String(value);
+  }
 }
 
 function formatSegmentTime(segment) {
@@ -2762,31 +3166,43 @@ function formatDurationLabel(seconds) {
 }
 
 function formatAbsoluteSegmentTime(item, segment) {
-  const start = absoluteSegmentDate(item.startTime, segment.start);
-  const end = absoluteSegmentDate(item.startTime, segment.end);
-  if (start && end) {
-    return `${formatTime(start.toISOString())} - ${formatTime(end.toISOString())}`;
+  const start = absoluteCameraSegmentMs(item.startTime, segment.start);
+  const end = absoluteCameraSegmentMs(item.startTime, segment.end);
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    return `${formatTime(new Date(start).toISOString())} - ${formatTime(new Date(end).toISOString())}`;
   }
-  return formatSegmentTime(segment) || `${formatTime(item.startTime)} - ${formatTime(item.endTime)}`;
+  return formatSegmentTime(segment) || `${formatCameraTime(item.startTime)} - ${formatCameraTime(item.endTime)}`;
 }
 
-function absoluteSegmentDate(baseValue, offsetSeconds) {
-  const base = new Date(baseValue);
-  if (Number.isNaN(base.getTime()) || !Number.isFinite(Number(offsetSeconds))) return null;
-  return new Date(base.getTime() + (Number(offsetSeconds) * 1000));
+function absoluteCameraSegmentMs(baseValue, offsetSeconds) {
+  if (!Number.isFinite(Number(offsetSeconds))) return Number.NaN;
+  try {
+    return (hasExplicitTimeZone(baseValue) ? Date.parse(baseValue) : zonedDateTimeMs(baseValue, cameraTimeZone()))
+      + (Number(offsetSeconds) * 1000);
+  } catch {
+    return Number.NaN;
+  }
 }
 
 function recordingDurationSeconds(item) {
-  return secondsBetween(item.startTime, item.endTime);
+  try {
+    return Math.max(0, (zonedDateTimeMs(item.endTime, cameraTimeZone()) - zonedDateTimeMs(item.startTime, cameraTimeZone())) / 1000);
+  } catch {
+    return 0;
+  }
 }
 
 function recordingCoverage(item, fromValue, toValue) {
-  const rangeStart = new Date(fromValue);
-  const rangeEnd = new Date(toValue);
-  const itemStart = new Date(item.startTime || fromValue);
-  const itemEnd = new Date(item.endTime || toValue);
-
-  if ([rangeStart, rangeEnd, itemStart, itemEnd].some(date => Number.isNaN(date.getTime()))) {
+  let rangeStartMs;
+  let rangeEndMs;
+  let itemStartMs;
+  let itemEndMs;
+  try {
+    rangeStartMs = zonedDateTimeMs(fromValue, cameraTimeZone());
+    rangeEndMs = zonedDateTimeMs(toValue, cameraTimeZone());
+    itemStartMs = zonedDateTimeMs(item.startTime || fromValue, cameraTimeZone());
+    itemEndMs = zonedDateTimeMs(item.endTime || toValue, cameraTimeZone());
+  } catch {
     const fallbackSeconds = secondsBetween(item.startTime || fromValue, item.endTime || toValue);
     return fallbackSeconds > 0
       ? {
@@ -2798,12 +3214,12 @@ function recordingCoverage(item, fromValue, toValue) {
       : null;
   }
 
-  const startMs = Math.max(rangeStart.getTime(), itemStart.getTime());
-  const endMs = Math.min(rangeEnd.getTime(), itemEnd.getTime());
+  const startMs = Math.max(rangeStartMs, itemStartMs);
+  const endMs = Math.min(rangeEndMs, itemEndMs);
   if (endMs <= startMs) return null;
 
   return {
-    offsetSeconds: Math.max(0, (startMs - itemStart.getTime()) / 1000),
+    offsetSeconds: Math.max(0, (startMs - itemStartMs) / 1000),
     durationSeconds: (endMs - startMs) / 1000,
     from: new Date(startMs).toISOString(),
     to: new Date(endMs).toISOString()
@@ -2811,10 +3227,13 @@ function recordingCoverage(item, fromValue, toValue) {
 }
 
 function secondsBetween(startValue, endValue) {
-  const start = new Date(startValue);
-  const end = new Date(endValue);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
-  return Math.max(0, (end.getTime() - start.getTime()) / 1000);
+  try {
+    const start = zonedDateTimeMs(startValue, displayTimeZone());
+    const end = zonedDateTimeMs(endValue, displayTimeZone());
+    return Math.max(0, (end - start) / 1000);
+  } catch {
+    return 0;
+  }
 }
 
 function delay(ms, signal) {
